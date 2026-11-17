@@ -4,9 +4,21 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use zeroize::ZeroizeOnDrop;
+
+/// CHECKSUM_DOMAIN para derivação do endereço estilo Tor.
+const CHECKSUM_DOMAIN: &[u8] = b".p2pgit checksum";
+
+/// Wrapper que zera a memória ao cair (protege chaves privadas).
+#[derive(ZeroizeOnDrop)]
+#[cfg(test)]
+pub struct SigningKeyBytes(pub [u8; 32]);
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RepoIdentity {
     pub public_key_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key_hex: Option<String>, // None se for apenas um clone de terceiros
     pub onion_like_address: String,
     pub alias: Option<String>,
@@ -20,10 +32,26 @@ impl RepoIdentity {
         let verifying_key = signing_key.verifying_key();
 
         let address = Self::derive_tor_address(&verifying_key);
+        let priv_bytes = signing_key.to_bytes();
 
         Self {
             public_key_hex: hex::encode(verifying_key.to_bytes()),
-            private_key_hex: Some(hex::encode(signing_key.to_bytes())),
+            private_key_hex: Some(hex::encode(priv_bytes)),
+            onion_like_address: address,
+            alias,
+        }
+    }
+
+    /// Cria uma identidade a partir de uma seed determinística (para testes).
+    #[cfg(test)]
+    pub fn from_seed(seed: [u8; 32], alias: Option<String>) -> Self {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        let address = Self::derive_tor_address(&verifying_key);
+
+        Self {
+            public_key_hex: hex::encode(verifying_key.to_bytes()),
+            private_key_hex: Some(hex::encode(seed)),
             onion_like_address: address,
             alias,
         }
@@ -34,7 +62,7 @@ impl RepoIdentity {
         let pub_bytes = pub_key.to_bytes();
 
         let mut hasher = Sha256::new();
-        hasher.update(b".p2pgit checksum");
+        hasher.update(CHECKSUM_DOMAIN);
         hasher.update(pub_bytes);
         let hash = hasher.finalize();
 
@@ -70,7 +98,7 @@ impl RepoIdentity {
             .map_err(|_| anyhow::anyhow!("Chave pública inválida no endereço"))?;
 
         let mut hasher = Sha256::new();
-        hasher.update(b".p2pgit checksum");
+        hasher.update(CHECKSUM_DOMAIN);
         hasher.update(pub_arr);
         let hash = hasher.finalize();
 
@@ -148,5 +176,22 @@ mod tests {
         let id = RepoIdentity::generate(None);
         let key = RepoIdentity::verify_address(&id.onion_like_address).unwrap();
         assert_eq!(hex::encode(key.to_bytes()), id.public_key_hex);
+    }
+
+    #[test]
+    fn from_seed_is_deterministic() {
+        let seed = [0x42; 32];
+        let a = RepoIdentity::from_seed(seed, None);
+        let b = RepoIdentity::from_seed(seed, None);
+        assert_eq!(a.onion_like_address, b.onion_like_address);
+        assert_eq!(a.public_key_hex, b.public_key_hex);
+    }
+
+    #[test]
+    fn signing_key_bytes_zeroizes_on_drop() {
+        let key = SigningKeyBytes([0xAA; 32]);
+        assert_eq!(key.0[0], 0xAA);
+        // Ao cair, o zeroize deve limpar a memória.
+        drop(key);
     }
 }

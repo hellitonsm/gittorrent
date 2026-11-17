@@ -12,6 +12,7 @@
 | **0 — Consolidação do MVP local** | ✅ Concluída | Hash canônico (BTreeMap + vetores ordenados), varredura recursiva com `.p2pgitignore`, PR assinado anti-reencaminhamento, `log`/`show`/`checkout`, `GuardPolicy` + `--yes`/`--strict`, commits indexados por hash completo. 20 testes + clippy limpo. |
 | **1 — Rede real (DHT)** | ✅ Concluída | `P2pNode` com event-loop em background, `identify` (sem ele o kad fica em modo Client e ignora requests inbound), validação na borda via `validate_commit_record`, histórico completo `endereço#hash`, alias BEP-44 com `seq`, gossipsub `p2pgit/announce/v1`, bootstrap padrão em `~/.p2pgit/bootstrap.txt`. 22 testes com `--features network`. E2E: 2 daemons em loopback, clone por endereço e por alias, histórico de 2 commits, clone via 3º nó que só conhece um bootstrap. |
 | **2 — Binários via BitTorrent** | ✅ Concluída | `add-binary` (MD5 + SHA-256 + infohash opcional, grava em `.binary`), `fetch-binaries` (magnet → `aria2c` → valida MD5/SHA-256 → grava `.p2pgit/binaries.lock`), varredura do commit ignora binários do manifesto, guard no clone verifica `binaries/<file_path>` (ausente → aviso com instrução; divergente → bloqueio). 26 testes. E2E: binário ausente/correto/corrompido validados no clone. |
+| **3 — Dependências `.p2pdeps`** | ✅ Concluída | `add-dep` (resolve HEAD na DHT ou fixa com `--pin`, grava em `.p2pdeps`), montagem no clone em `<out>/<mount_path>` com recursão (`--depth`, padrão 1) e detecção de ciclo por (alvo, hash fixado), `.p2pgit/deps.lock` com o resultado por dependência. HEAD do repo semeado sob a chave plana **e** `#hash`. 29 testes. E2E: clone pela DHT traz `deps/crypto/`; pin adulterado → falha; ciclo → ignorado com aviso. |
 | **3 — Dependências `.p2pdeps`** | ⬜ Pendente | |
 | **4 — PRs pela rede** | ⬜ Pendente | |
 | **5 — Endurecimento** | ⬜ Pendente | |
@@ -224,6 +225,14 @@
 ---
 
 ## Fase 3 — Dependências `.p2pdeps` (submódulos P2P)
+
+> **✅ Concluída** (2026-11-17). Comando `add-dep` e montagem no clone
+> implementados em `main.rs`; busca do commit fixado em
+> `p2p::fetch_pinned_commit` (valida assinatura + hash da chave);
+> `network::dep_identity_key` para detecção de ciclo; `.p2pgit/deps.lock`.
+> Descoberta importante: o HEAD precisa ser semeado **também** sob
+> `<endereço>#<hash>`, senão a dependência fixada no HEAD atual não é
+> encontrada na DHT.
 
 **Objetivo:** `mount_path` deixar de ser decorativo.
 

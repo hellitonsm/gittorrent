@@ -31,6 +31,15 @@ pub fn alias_record_key(namespace: &str, alias: &str) -> String {
     format!("alias:{}:{}", namespace, alias)
 }
 
+/// Identidade de uma dependência resolvida (alvo + commit fixado).
+///
+/// Usada para detectar ciclos no grafo de `.p2pdeps`: se a mesma dupla
+/// (alvo, hash fixado) aparecer duas vezes na montagem, há ciclo.
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+pub fn dep_identity_key(target: &str, pinned_hash: &str) -> String {
+    format!("{}#{}", target, pinned_hash)
+}
+
 /// Como o cliente reage a conteúdo suspeito ao baixar um commit.
 ///
 /// - `Interactive`      — alerta e pergunta (padrão em TTY).
@@ -529,5 +538,24 @@ mod tests {
 
         // Chave fora do formato do sistema.
         assert!(validate_commit_record("chave-aleatoria", &value, GuardPolicy::DenyAll).is_err());
+    }
+
+    #[test]
+    fn dep_identity_key_separates_targets_and_hashes() {
+        // Mesmo alvo, hashes diferentes → chaves diferentes (deps distintos).
+        assert_ne!(
+            dep_identity_key("lib.p2pgit", "aa"),
+            dep_identity_key("lib.p2pgit", "bb")
+        );
+        // Alvos diferentes, mesmo hash → chaves diferentes (evita falso ciclo).
+        assert_ne!(
+            dep_identity_key("lib-b.p2pgit", "aa"),
+            dep_identity_key("lib.p2pgit", "aa")
+        );
+        // Mesma dupla = ciclo detectável.
+        assert_eq!(
+            dep_identity_key("lib.p2pgit", "aa"),
+            dep_identity_key("lib.p2pgit", "aa")
+        );
     }
 }

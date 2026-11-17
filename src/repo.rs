@@ -121,6 +121,10 @@ impl Commit {
     ) -> anyhow::Result<Self> {
         let mut total_size = 0;
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
         for (path, content) in &files {
             total_size += content.len();
 
@@ -155,15 +159,18 @@ impl Commit {
         let mut commit = Self {
             parent_hash,
             author_pubkey: identity.public_key_hex.clone(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
+            timestamp: now,
             message,
             files,
             external_binaries,
             linked_repos,
             signature: String::new(),
         };
+
+        // Valida timestamp: não pode ser muito no futuro (skew de 5 min).
+        if commit.timestamp > now + 300 {
+            anyhow::bail!("Timestamp do commit está no futuro (skew > 5 min).");
+        }
 
         let payload_hash = commit.compute_hash();
         commit.signature = identity.sign_data(payload_hash.as_bytes())?;

@@ -17,8 +17,8 @@ MVP de um sistema de controle de versão P2P que combina:
 ```bash
 cargo build                     # MVP local (rápido)
 cargo build --features network  # inclui nó Kademlia/Gossipsub/Identify real
-cargo test                      # 24 testes unitários
-cargo test --features network   # 26 testes (inclui 2 nós em loopback)
+cargo test                      # 27 testes unitários
+cargo test --features network   # 29 testes (inclui 2 nós em loopback)
 ```
 
 O binário fica em `target/debug/git_torrent`.
@@ -33,7 +33,7 @@ O binário fica em `target/debug/git_torrent`.
 | `p2pgit log` | Lista o histórico seguindo a cadeia `parent_hash` (HEAD → raiz). |
 | `p2pgit show [hash]` | Mostra detalhes e arquivos de um commit (padrão: HEAD). |
 | `p2pgit checkout <hash>` | Restaura o diretório de trabalho em um commit antigo (HEAD detached), com todas as validações de segurança. |
-| `p2pgit clone <alvo> [--out clone] [--bootstrap <addr>...]` | Valida e clona um commit (arquivo `.json`, endereço `.p2pgit` ou alias). Com a feature `network`, busca o HEAD **e o histórico** na DHT antes de recorrer aos arquivos locais. Aplica todos os bloqueios de segurança. |
+| `p2pgit clone <alvo> [--out clone] [--bootstrap <addr>...] [--depth N]` | Valida e clona um commit (arquivo `.json`, endereço `.p2pgit` ou alias). Com a feature `network`, busca o HEAD **e o histórico** na DHT antes de recorrer aos arquivos locais e monta as dependências do `.p2pdeps` (`--depth`, padrão 1). Aplica todos os bloqueios de segurança. |
 | `p2pgit create-pr <endereço> [--out pr.json]` | Gera um Pull Request **assinado pela chave do fork** (o alvo é validado como endereço ou alias). Se recusado, o fork permanece válido. |
 | `p2pgit approve-pr <pr.json>` | Verifica assinatura do PR, destinatário e autor do commit antes de re-assinar o merge com a chave privada do repositório original. |
 | `p2pgit status` | Mostra endereço, chave pública, HEAD e aliases. |
@@ -41,6 +41,7 @@ O binário fica em `target/debug/git_torrent`.
 | `p2pgit check-binary <arquivo> <md5>` | Valida o MD5 de um binário baixado contra o manifesto `.binary`. |
 | `p2pgit add-binary <arquivo> [--description ...] [--torrent-infohash <40hex>]` | Registra o binário no manifesto `.binary` com MD5 **e SHA-256** calculados (o binário sai do commit de código puro). |
 | `p2pgit fetch-binaries [--out-dir binaries]` | Baixa via magnet (`aria2c`) os binários com `torrent_infohash` e valida MD5/SHA-256; grava o resultado em `.p2pgit/binaries.lock`. |
+| `p2pgit add-dep <endereço-ou-alias> --mount deps/crypto [--pin <hash>] [--name <nome>]` | Registra uma dependência em `.p2pdeps` fixada por hash (sem `--pin`, resolve o HEAD atual do alvo na DHT). |
 | `p2pgit daemon [--bootstrap <peer/multiaddr>...]` | **(feature `network`)** Inicia o nó DHT, semeia o repositório local (HEAD + histórico + aliases) e anuncia novos HEADs via gossipsub. Bootstrap padrão: `~/.p2pgit/bootstrap.txt`. |
 
 Flags globais de segurança (aplicam-se a `clone`, `checkout`, `approve-pr` e `verify`):
@@ -118,7 +119,7 @@ clone). O resultado do download fica em `.p2pgit/binaries.lock`.
 
 ## `.p2pdeps` — repositórios essenciais linkados
 
-Evita inflar o repositório com dependências. Cada entrada aponta para outro endereço `.p2pgit`/alias em um commit fixado:
+Evita inflar o repositório com dependências. Cada entrada aponta para outro endereço `.p2pgit`/alias em um commit **fixado**:
 
 ```json
 [
@@ -130,6 +131,23 @@ Evita inflar o repositório com dependências. Cada entrada aponta para outro en
   }
 ]
 ```
+
+Registre e use:
+
+```bash
+# fixa o HEAD atual do alvo (resolvido na DHT) ou informe --pin <hash completo>
+git_torrent add-dep crypto-lib.open.p2pgit --mount deps/crypto
+git_torrent commit -m "adiciona dependência"
+
+# no clone, as dependências são montadas em <mount_path> (padrão: 1 nível)
+git_torrent clone <endereço> --out repo --bootstrap <nó>
+# → repo/deps/crypto/<arquivos do commit fixado>
+```
+
+O clone busca cada dependência pela chave `<endereço>#<pinned_hash>`, valida
+assinatura **e** o hash fixado, e grava o resultado em
+`.p2pgit/deps.lock`. Ciclos (A→B→A) são detectados e ignorados; `--depth 2`
+monta também as dependências das dependências.
 
 ## Estrutura do código
 
@@ -154,7 +172,8 @@ src/
 - A busca de binários por `infohash` em trackers/DHT BitTorrent e a verificação automática pós-download ainda são responsabilidade do cliente/usuário (use `check-binary`).
 - O merge de PRs re-assina a árvore proposta como um novo commit filho do commit do fork, preservando o DAG.
 - **Binários via BitTorrent — Fase 2 concluída:** `add-binary` grava MD5 + SHA-256 + infohash no `.binary`; `fetch-binaries` baixa via magnet (`aria2c`) e valida a integridade; o guard do clone verifica `binaries/<file_path>` (ausente → aviso, divergente → bloqueio).
-- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 3 — dependências `.p2pdeps`).
+- **Dependências `.p2pdeps` — Fase 3 concluída:** `add-dep` fixa um commit por hash (ou resolve o HEAD na DHT); o clone monta cada dependência em `<mount_path>` com recursão (`--depth`) e detecção de ciclo, registrando tudo em `.p2pgit/deps.lock`.
+- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 4 — PRs pela rede).
 
 ### Testando a rede localmente (2 daemons)
 

@@ -558,6 +558,32 @@ fn looks_like_address(target: &str) -> bool {
         .is_some_and(|body| body.len() == 56 && body.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
+/// Resolve um endereço `.p2pgit` ou um alias BEP-44 para o endereço final.
+///
+/// Um endereço real é BASE32 de 35 bytes = 56 chars + ".p2pgit"; alias como
+/// "meu-projeto.open.p2pgit" também terminam em `.p2pgit`, então o tamanho
+/// do corpo é o que os distingue.
+async fn resolve_address(node: &mut P2pNode, target: &str) -> anyhow::Result<String> {
+    if looks_like_address(target) {
+        RepoIdentity::verify_address(target)?; // checksum e versão
+        return Ok(target.to_string());
+    }
+    let (alias, namespace) = split_alias(target);
+    let key = alias_record_key(&namespace, &alias);
+    let bytes = node
+        .get_record(&key)
+        .await?
+        .ok_or_else(|| anyhow!("nenhum registro de alias '{key}' na DHT"))?;
+    let envelope: AliasEnvelope = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("registro de alias '{key}' corrompido: {e}"))?;
+    anyhow::ensure!(
+        envelope.is_valid(),
+        "registro de alias '{key}' com assinatura inválida"
+    );
+    println!("Alias '{key}' -> {}", envelope.record.target_address);
+    Ok(envelope.record.target_address)
+}
+
 /// Resolve endereço/alias na DHT e baixa o HEAD + histórico disponível.
 ///
 /// Cada registro passa por `validate_commit_record` (assinatura, sanitização,
@@ -568,37 +594,13 @@ pub async fn fetch_commit(
     policy: GuardPolicy,
 ) -> anyhow::Result<FetchedRepo> {
     let mut node = P2pNode::new(parse_bootstrap(bootstrap)?).await?;
-
-    // 1. Resolve o endereço final (direto ou via registro de alias).
-    //    Um endereço real é BASE32 de 35 bytes = 56 chars + ".p2pgit";
-    //    alias como "meu-projeto.open.p2pgit" também terminam em .p2pgit,
-    //    então o tamanho do corpo é o que os distingue.
-    let address = if looks_like_address(target) {
-        RepoIdentity::verify_address(target)?; // checksum e versão
-        target.to_string()
-    } else {
-        let (alias, namespace) = split_alias(target);
-        let key = alias_record_key(&namespace, &alias);
-        let bytes = node
-            .get_record(&key)
-            .await?
-            .ok_or_else(|| anyhow!("nenhum registro de alias '{}' na DHT", key))?;
-        let envelope: AliasEnvelope = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow!("registro de alias '{}' corrompido: {}", key, e))?;
-        anyhow::ensure!(
-            envelope.is_valid(),
-            "registro de alias '{}' com assinatura inválida",
-            key
-        );
-        println!("Alias '{}' -> {}", key, envelope.record.target_address);
-        envelope.record.target_address
-    };
+    let address = resolve_address(&mut node, target).await?;
 
     // 2. HEAD sob `<endereço>`.
     let head_bytes = node
         .get_record(&address)
         .await?
-        .ok_or_else(|| anyhow!("nenhum commit publicado sob {}", address))?;
+        .ok_or_else(|| anyhow!("nenhum commit publicado sob {address}"))?;
     let head = validate_commit_record(&address, &head_bytes, policy)?;
 
     // 3. Histórico: `<endereço>#<parent_hash>` até a raiz ou ausência.
@@ -610,24 +612,20 @@ pub async fn fetch_commit(
             break;
         }
         let key = commit_record_key(&address, Some(&hash));
-        match node.get_record(&key).await {
-            Ok(Some(bytes)) => match validate_commit_record(&key, &bytes, policy) {
+        if let Ok(Some(bytes)) = node.get_record(&key).await {
+            match validate_commit_record(&key, &bytes, policy) {
                 Ok(c) => {
                     parent = c.parent_hash.clone();
                     chain.push(c);
                 }
                 Err(e) => {
-                    eprintln!("[DHT] registro '{}' rejeitado: {}", key, e);
+                    eprintln!("[DHT] registro '{key}' rejeitado: {e}");
                     break;
                 }
-            },
-            _ => {
-                eprintln!(
-                    "[DHT] '{}' ausente — histórico incompleto (commit de fork não semeado?)",
-                    key
-                );
-                break;
             }
+        } else {
+            eprintln!("[DHT] '{key}' ausente — histórico incompleto (commit de fork não semeado?)");
+            break;
         }
     }
 
@@ -636,6 +634,35 @@ pub async fn fetch_commit(
         head,
         chain,
     })
+}
+
+/// Busca um commit **fixado por hash** de uma dependência `.p2pdeps`.
+///
+/// Resolve o endereço/alias na DHT e lê o registro `<endereço>#<hash>`.
+/// `validate_commit_record` recusa qualquer coisa cujo hash não bata com o
+/// fixado — é o que impede montar um commit adulterado no `mount_path`.
+pub async fn fetch_pinned_commit(
+    target: &str,
+    pinned_hash: &str,
+    bootstrap: &[String],
+    policy: GuardPolicy,
+) -> anyhow::Result<(String, Commit)> {
+    let mut node = P2pNode::new(parse_bootstrap(bootstrap)?).await?;
+    let address = resolve_address(&mut node, target).await?;
+    let key = commit_record_key(&address, Some(pinned_hash));
+    let bytes = node
+        .get_record(&key)
+        .await?
+        .ok_or_else(|| anyhow!("nenhum registro '{key}' na DHT"))?;
+    let commit = validate_commit_record(&key, &bytes, policy)?;
+    Ok((address, commit))
+}
+
+/// Resolve apenas o endereço de um alvo (alias → endereço, DHT).
+/// Usado por `add-dep` para gravar o endereço real no `.p2pdeps`.
+pub async fn resolve_target_address(target: &str, bootstrap: &[String]) -> anyhow::Result<String> {
+    let mut node = P2pNode::new(parse_bootstrap(bootstrap)?).await?;
+    resolve_address(&mut node, target).await
 }
 
 /// Sequência monotônica para registros mutáveis (BEP-44 style), persistida em `.p2pgit/seq`.
@@ -663,7 +690,7 @@ pub async fn publish_alias(
     let key = alias_record_key(namespace, alias);
     node.put_record(&key, serde_json::to_vec(&envelope)?)
         .await?;
-    println!("Alias '{}' (seq={}) publicado na DHT.", key, seq);
+    println!("Alias '{key}' (seq={seq}) publicado na DHT.");
     Ok(())
 }
 
@@ -688,19 +715,26 @@ pub async fn seed_local_repo(node: &mut P2pNode) -> anyhow::Result<usize> {
         let bytes = std::fs::read(entry.path())?;
         let commit: Commit = serde_json::from_slice(&bytes)?;
         if commit.compute_hash() != hash {
-            eprintln!(
-                "[seed] '{}' não corresponde ao hash do arquivo — ignorado",
-                name
-            );
+            eprintln!("[seed] '{name}' não corresponde ao hash do arquivo — ignorado");
             continue;
         }
-        let key = if hash == head {
-            commit_record_key(&id.onion_like_address, None)
+        // O HEAD é publicado sob a chave plana (resolução de "último commit")
+        // E sob `<endereço>#<hash>` — dependências `.p2pdeps` fixam o hash e
+        // precisam encontrá-lo mesmo quando ele ainda é o HEAD.
+        let address = &id.onion_like_address;
+        let is_head = hash == head;
+        let keys = if is_head {
+            vec![
+                commit_record_key(address, None),
+                commit_record_key(address, Some(hash)),
+            ]
         } else {
-            commit_record_key(&id.onion_like_address, Some(hash))
+            vec![commit_record_key(address, Some(hash))]
         };
-        node.put_record(&key, bytes).await?;
-        seeded += 1;
+        for key in keys {
+            node.put_record(&key, bytes.clone()).await?;
+            seeded += 1;
+        }
     }
 
     // Aliases deste repositório, como registros mutáveis assinados.

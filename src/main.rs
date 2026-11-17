@@ -16,6 +16,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+// `warn` só é usado nos caminhos com feature 'network'.
+#[cfg_attr(not(feature = "network"), allow(unused_imports))]
+use tracing::{info, warn, Level};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CLIENT_NAMESPACE: &str = DEFAULT_NAMESPACE;
 
@@ -24,6 +28,15 @@ const HEAD_FILE: &str = ".p2pgit/HEAD";
 const ALIASES_FILE: &str = ".p2pgit/aliases.json";
 const BINARIES_FILE: &str = ".binary";
 const DEPS_FILE: &str = ".p2pdeps";
+
+/// Inicializa o subscriber de logging com base em P2PGIT_LOG ou padrão.
+fn init_tracing() {
+    let filter = EnvFilter::from_default_env().add_directive(Level::INFO.into());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
 
 #[derive(Parser)]
 #[command(
@@ -84,6 +97,9 @@ enum Commands {
         /// Nodes bootstrap da DHT (feature 'network'); padrão: ~/.p2pgit/bootstrap.txt
         #[arg(long)]
         bootstrap: Vec<String>,
+        /// Profundidade de dependências `.p2pdeps` a montar (padrão: 1)
+        #[arg(long, default_value_t = 1)]
+        depth: u32,
     },
     /// Cria um Pull Request assinado para o repositório original (se recusado, vira Fork)
     CreatePr {
@@ -108,11 +124,28 @@ enum Commands {
         #[arg(long)]
         torrent_infohash: Option<String>,
     },
-    /// Busca na rede BitTorrent os binários referenciados no '.binary' (via magnet) e valida
+    /// Busca na rede BitTorrent os binários referenciados no `.binary` (via magnet) e valida
     FetchBinaries {
-        /// Diretório de destino dos downloads (padrão: binaries)
+        /// Diretório de destino dos downloads (padrão: `binaries`)
         #[arg(long, default_value = "binaries")]
         out_dir: String,
+    },
+    /// Adiciona uma dependência `.p2pdeps` (repositório linkado fixado por hash)
+    AddDep {
+        /// Endereço `.p2pgit` ou alias do repositório dependente
+        target: String,
+        /// Hash completo (64 hex) do commit fixado; default: HEAD atual do alvo na DHT
+        #[arg(long)]
+        pin: Option<String>,
+        /// Caminho de montagem relativo (ex: deps/crypto)
+        #[arg(long)]
+        mount: String,
+        /// Nome da dependência (default: último segmento do mount)
+        #[arg(long)]
+        name: Option<String>,
+        /// Nodes bootstrap da DHT (feature 'network'); padrão: ~/.p2pgit/bootstrap.txt
+        #[arg(long)]
+        bootstrap: Vec<String>,
     },
     /// Inicia um nó DHT Kademlia (requer a feature 'network')
     #[cfg(feature = "network")]
@@ -161,13 +194,24 @@ fn write_head(hash: &str) -> anyhow::Result<()> {
 }
 
 /// Salva o commit indexado pelo hash COMPLETO e atualiza o HEAD.
+/// Escrita atômica: salva em .tmp, renomeia, depois atualiza o HEAD.
 fn save_commit(commit: &Commit) -> anyhow::Result<String> {
     let hash = commit.compute_hash();
-    fs::write(
-        format!(".p2pgit/commit_{}.json", hash),
-        serde_json::to_string_pretty(commit)?,
-    )?;
+    let tmp = format!(".p2pgit/.tmp_commit_{}.json", &hash[..8]);
+    let final_path = format!(".p2pgit/commit_{}.json", hash);
+
+    // Garante que o diretório .p2pgit existe.
+    fs::create_dir_all(".p2pgit")?;
+
+    // Escreve no arquivo temporário.
+    fs::write(&tmp, serde_json::to_string_pretty(commit)?)?;
+
+    // Rename atômico para o destino final.
+    fs::rename(&tmp, &final_path)?;
+
+    // Atualiza o HEAD por último — se falhar, o commit já está salvo.
     write_head(&hash)?;
+
     Ok(hash)
 }
 
@@ -201,6 +245,19 @@ fn load_commit(prefix: &str) -> anyhow::Result<Commit> {
 
 /// Escreve os arquivos do commit no diretório de saída do clone.
 fn write_clone(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
+    write_commit_files(out_path, commit)?;
+    info!(
+        "Código verificado e clonado em '{}' ({} arquivo(s)).",
+        out_path.display(),
+        commit.files.len()
+    );
+    info!("Commit clonado: {}", commit.compute_hash());
+    Ok(())
+}
+
+/// Escreve apenas os arquivos do commit (sem log) — usado no `mount_path`
+/// das dependências `.p2pdeps`.
+fn write_commit_files(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
     fs::create_dir_all(out_path)?;
     for (path, content) in &commit.files {
         let dest = out_path.join(path);
@@ -209,20 +266,116 @@ fn write_clone(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
         }
         fs::write(dest, content)?;
     }
-    println!(
-        "Código verificado e clonado em '{}' ({} arquivo(s)).",
-        out_path.display(),
-        commit.files.len()
-    );
-    println!("Commit clonado: {}", commit.compute_hash());
+    Ok(())
+}
+
+/// Monta as dependências `.p2pdeps` do commit em `<base>/<mount_path>`.
+///
+/// Cada dependência é resolvida na DHT (`fetch_pinned_commit`, que valida
+/// assinatura, autor e o **hash fixado**) e gravada no `mount_path`.
+/// A recursão respeita `depth` e detecta ciclos pela dupla
+/// (alvo, hash fixado) já visitada — um ciclo é ignorado, não trava.
+/// Falhas individuais são registradas em `resolved` sem abortar o clone.
+#[cfg(feature = "network")]
+#[allow(clippy::too_many_arguments)]
+async fn mount_dependencies(
+    head: &Commit,
+    base: &Path,
+    boot: &[String],
+    policy: GuardPolicy,
+    depth: u32,
+    visited: &mut HashSet<String>,
+    resolved: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    if depth == 0 {
+        return Ok(());
+    }
+    for dep in &head.linked_repos {
+        let id = network::dep_identity_key(&dep.target_address_or_alias, &dep.pinned_commit_hash);
+        if !visited.insert(id) {
+            warn!(
+                "[deps] ciclo detectado em '{}' — dependência ignorada",
+                dep.target_address_or_alias
+            );
+            continue;
+        }
+
+        match p2p::fetch_pinned_commit(
+            &dep.target_address_or_alias,
+            &dep.pinned_commit_hash,
+            boot,
+            policy,
+        )
+        .await
+        {
+            Ok((address, commit)) => {
+                let mount = base.join(&dep.mount_path);
+                write_commit_files(&mount, &commit)?;
+                // Metadados da dep no mount point (permite `log` local ali).
+                let meta = mount.join(".p2pgit");
+                fs::create_dir_all(&meta)?;
+                fs::write(
+                    meta.join(format!("commit_{}.json", commit.compute_hash())),
+                    serde_json::to_string_pretty(&commit)?,
+                )?;
+                fs::write(meta.join("HEAD"), commit.compute_hash())?;
+                resolved.push(serde_json::json!({
+                    "name": dep.name,
+                    "target": dep.target_address_or_alias,
+                    "address": address,
+                    "pinned_commit_hash": dep.pinned_commit_hash,
+                    "mount_path": dep.mount_path,
+                    "status": "ok",
+                }));
+                info!(
+                    "Dependência '{}' montada em '{}' ({} arquivo(s)).",
+                    dep.name,
+                    mount.display(),
+                    commit.files.len()
+                );
+                // Recursão: deps da dep (um nível menos).
+                if depth > 1 {
+                    Box::pin(mount_dependencies(
+                        &commit,
+                        &mount,
+                        boot,
+                        policy,
+                        depth - 1,
+                        visited,
+                        resolved,
+                    ))
+                    .await?;
+                }
+            }
+            Err(e) => {
+                resolved.push(serde_json::json!({
+                    "name": dep.name,
+                    "target": dep.target_address_or_alias,
+                    "pinned_commit_hash": dep.pinned_commit_hash,
+                    "mount_path": dep.mount_path,
+                    "status": "failed",
+                    "reason": e.to_string(),
+                }));
+                warn!("[deps] falha ao resolver '{}': {}", dep.name, e);
+            }
+        }
+    }
     Ok(())
 }
 
 /// Baixa um magnet BitTorrent via cliente externo (`aria2c`).
 /// Requer `aria2c` instalado no sistema (ou outro cliente compatível).
+/// Faz download para um .tmp e só move para o destino após validação.
 async fn download_via_magnet(magnet: &str, out_path: &Path) -> anyhow::Result<()> {
+    let tmp_path = out_path.with_extension("tmp");
+
+    // Garante que o diretório de destino existe.
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
     let mut cmd = tokio::process::Command::new("aria2c");
-    cmd.arg(magnet).arg("-o").arg(out_path);
+    cmd.arg(magnet).arg("-o").arg(&tmp_path);
     let status = match cmd.status().await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -234,11 +387,56 @@ async fn download_via_magnet(magnet: &str, out_path: &Path) -> anyhow::Result<()
         Err(e) => return Err(e.into()),
     };
     if !status.success() {
+        // Limpa o tmp em caso de falha.
+        let _ = fs::remove_file(&tmp_path);
         anyhow::bail!("aria2c falhou com exit code {:?}", status.code());
     }
-    if !out_path.exists() {
-        anyhow::bail!("aria2c não produziu o arquivo em {}", out_path.display());
+    if !tmp_path.exists() {
+        anyhow::bail!("aria2c não produziu o arquivo em {}", tmp_path.display());
     }
+
+    // Move para o destino final.
+    fs::rename(&tmp_path, out_path)?;
+    Ok(())
+}
+
+/// Resolve `bootstrap` (padrão `~/.p2pgit/bootstrap.txt`), monta as
+/// dependências `.p2pdeps` do clone e grava `.p2pgit/deps.lock`.
+#[cfg(feature = "network")]
+async fn mount_cloned_dependencies(
+    head: &Commit,
+    out_path: &Path,
+    bootstrap: &[String],
+    policy: GuardPolicy,
+    depth: u32,
+) -> anyhow::Result<()> {
+    if depth == 0 {
+        return Ok(());
+    }
+    let boot = if bootstrap.is_empty() {
+        p2p::default_bootstrap()
+    } else {
+        bootstrap.to_vec()
+    };
+    let mut visited = HashSet::new();
+    let mut resolved: Vec<serde_json::Value> = Vec::new();
+    mount_dependencies(
+        head,
+        out_path,
+        &boot,
+        policy,
+        depth,
+        &mut visited,
+        &mut resolved,
+    )
+    .await?;
+
+    let meta = out_path.join(".p2pgit");
+    fs::create_dir_all(&meta)?;
+    fs::write(
+        meta.join("deps.lock"),
+        serde_json::to_string_pretty(&resolved)?,
+    )?;
     Ok(())
 }
 
@@ -288,17 +486,29 @@ fn resolve_target(target: &str) -> anyhow::Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Init { alias } => {
             if Path::new(IDENTITY_FILE).exists() {
-                anyhow::bail!("Já existe um repositório neste diretório.");
+                anyhow::bail!("Já existe um repositório deste diretório.");
             }
 
             let id = RepoIdentity::generate(alias.clone());
             fs::create_dir_all(".p2pgit")?;
             fs::write(IDENTITY_FILE, serde_json::to_string_pretty(&id)?)?;
+
+            // Protege a identidade com permissões 600 (somente dono).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(IDENTITY_FILE) {
+                    let mut perm = meta.permissions();
+                    perm.set_mode(0o600);
+                    let _ = fs::set_permissions(IDENTITY_FILE, perm);
+                }
+            }
 
             // Arquivos padrão `.binary` e `.p2pdeps`.
             let default_binaries: Vec<BinaryManifestEntry> = vec![];
@@ -309,10 +519,10 @@ async fn main() -> anyhow::Result<()> {
             )?;
             fs::write(DEPS_FILE, serde_json::to_string_pretty(&default_deps)?)?;
 
-            println!("Repositório inicializado com sucesso!");
-            println!("Endereço Tor-style : {}", id.onion_like_address);
-            println!("Chave Pública      : {}", id.public_key_hex);
-            println!(
+            info!("Repositório inicializado com sucesso!");
+            info!("Endereço Tor-style : {}", id.onion_like_address);
+            info!("Chave Pública      : {}", id.public_key_hex);
+            info!(
                 "Chave Privada      : [SALVA EM {} - NÃO COMPARTILHE]",
                 IDENTITY_FILE
             );
@@ -322,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut registry = AliasRegistry::load(Path::new(ALIASES_FILE))?;
                 registry.insert(record.clone())?;
                 registry.save(Path::new(ALIASES_FILE))?;
-                println!(
+                info!(
                     "Alias registrado   : {} -> {}",
                     record.qualified(),
                     record.target_address
@@ -341,9 +551,9 @@ async fn main() -> anyhow::Result<()> {
             registry.insert(record.clone())?;
             registry.save(Path::new(ALIASES_FILE))?;
 
-            println!("Registro assinado pronto para propagação na DHT (BEP-44):");
-            println!("{}", serde_json::to_string_pretty(&record)?);
-            println!("\nSalvo localmente em {}", ALIASES_FILE);
+            info!("Registro assinado pronto para propagação na DHT (BEP-44):");
+            info!("{}", serde_json::to_string_pretty(&record)?);
+            info!("\nSalvo localmente em {}", ALIASES_FILE);
 
             // Publica o registro mutável assinado na DHT (feature network).
             #[cfg(feature = "network")]
@@ -355,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 match p2p::publish_alias(&id, &alias, &namespace, &boot).await {
                     Ok(()) => {}
-                    Err(e) => eprintln!("[DHT] alias não publicado agora: {}", e),
+                    Err(e) => warn!("[DHT] alias não publicado agora: {}", e),
                 }
             }
             #[cfg(not(feature = "network"))]
@@ -369,7 +579,8 @@ async fn main() -> anyhow::Result<()> {
             let id = read_identity()?;
 
             // Varredura recursiva do diretório (respeita .p2pgitignore).
-            let files = repo::collect_files(Path::new("."))?;
+            let files =
+                tokio::task::spawn_blocking(|| repo::collect_files(Path::new("."))).await??;
 
             let binaries: Vec<BinaryManifestEntry> =
                 serde_json::from_str(&fs::read_to_string(BINARIES_FILE)?)?;
@@ -387,8 +598,8 @@ async fn main() -> anyhow::Result<()> {
             )?;
 
             let hash = save_commit(&commit)?;
-            println!("Commit criado e assinado! Hash: {}", hash);
-            println!(
+            info!("Commit criado e assinado! Hash: {}", hash);
+            info!(
                 "Pronto para semear (seed) via DHT/Torrent: .p2pgit/commit_{}.json",
                 &hash[..12]
             );
@@ -405,14 +616,14 @@ async fn main() -> anyhow::Result<()> {
                     Ok(c) => c,
                     Err(_) => {
                         // Commits vindos de forks podem não existir localmente.
-                        println!(
+                        info!(
                             "{}  (commit ausente localmente — histórico incompleto)",
                             &current[..12.min(current.len())]
                         );
                         break;
                     }
                 };
-                println!(
+                info!(
                     "{}  {}  {}",
                     &current[..12.min(current.len())],
                     commit.timestamp,
@@ -424,7 +635,7 @@ async fn main() -> anyhow::Result<()> {
                     None => break,
                 }
             }
-            println!("({} commit(s) no histórico)", index);
+            info!("({} commit(s) no histórico)", index);
         }
 
         Commands::Show { hash } => {
@@ -433,17 +644,17 @@ async fn main() -> anyhow::Result<()> {
                 None => require_head()?,
             };
             let commit = load_commit(&prefix)?;
-            println!("Hash     : {}", commit.compute_hash());
-            println!("Autor    : {}", commit.author_pubkey);
-            println!("Timestamp: {}", commit.timestamp);
-            println!("Mensagem : {}", commit.message);
-            println!(
+            info!("Hash     : {}", commit.compute_hash());
+            info!("Autor    : {}", commit.author_pubkey);
+            info!("Timestamp: {}", commit.timestamp);
+            info!("Mensagem : {}", commit.message);
+            info!(
                 "Parent   : {}",
                 commit.parent_hash.as_deref().unwrap_or("(raiz)")
             );
-            println!("Arquivos ({}):", commit.files.len());
+            info!("Arquivos ({}):", commit.files.len());
             for (path, content) in &commit.files {
-                println!("  - {} ({} bytes)", path, content.len());
+                info!("  - {} ({} bytes)", path, content.len());
             }
         }
 
@@ -454,19 +665,25 @@ async fn main() -> anyhow::Result<()> {
             // Restaura apenas código assinado e inspecionado.
             client_download_guard(&commit, policy)?;
 
-            for (path, content) in &commit.files {
-                let dest = Path::new(path);
-                if let Some(parent) = dest.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent)?;
+            let files: Vec<(String, String)> = commit.files.clone().into_iter().collect();
+            let write_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                for (path, content) in &files {
+                    let dest = Path::new(path);
+                    if let Some(parent) = dest.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent)?;
+                        }
                     }
+                    fs::write(dest, content)?;
                 }
-                fs::write(dest, content)?;
-            }
+                Ok(())
+            })
+            .await?;
+            write_result?;
 
             let full = commit.compute_hash();
             write_head(&full)?;
-            println!(
+            info!(
                 "Checkout do commit {} concluído (HEAD detached). Arquivos não commitados podem ter sido sobrescritos.",
                 &full[..12]
             );
@@ -476,6 +693,7 @@ async fn main() -> anyhow::Result<()> {
             target,
             out,
             bootstrap,
+            depth,
         } => {
             let policy = resolve_policy(cli.strict, cli.yes);
             let out_path = Path::new(&out);
@@ -485,6 +703,13 @@ async fn main() -> anyhow::Result<()> {
                 let commit: Commit = serde_json::from_str(&fs::read_to_string(&target)?)?;
                 client_download_guard_at(&commit, policy, out_path)?;
                 write_clone(out_path, &commit)?;
+
+                // Fase 3: monta dependências (a DHT continua disponível).
+                #[cfg(feature = "network")]
+                let _ =
+                    mount_cloned_dependencies(&commit, out_path, &bootstrap, policy, depth).await;
+                #[cfg(not(feature = "network"))]
+                let _ = depth;
                 return Ok(());
             }
 
@@ -514,15 +739,24 @@ async fn main() -> anyhow::Result<()> {
                         write_clone(out_path, &fetched.head)?;
                         let h = fetched.head.compute_hash();
                         fs::write(meta.join("HEAD"), &h)?;
-                        println!(
+                        info!(
                             "Clonado da DHT: {} ({} commit(s) no histórico).",
                             fetched.address,
                             fetched.chain.len() + 1
                         );
+                        // Fase 3: monta as dependências .p2pdeps (recursivo, com ciclo).
+                        let _ = mount_cloned_dependencies(
+                            &fetched.head,
+                            out_path,
+                            &boot,
+                            policy,
+                            depth,
+                        )
+                        .await;
                         return Ok(());
                     }
                     Err(e) => {
-                        eprintln!("[DHT] não foi possível buscar '{}': {}", target, e);
+                        warn!("[DHT] não foi possível buscar '{}': {}", target, e);
                     }
                 }
             }
@@ -566,13 +800,13 @@ async fn main() -> anyhow::Result<()> {
             let out_file = out.unwrap_or_else(|| format!("pr_{}.json", pr.pr_id));
             fs::write(&out_file, serde_json::to_string_pretty(&pr)?)?;
 
-            println!(
+            info!(
                 "Pull Request {} assinado por {}",
                 pr.pr_id, id.onion_like_address
             );
-            println!("Para: {}", target_address);
-            println!("Salvo em: {}", out_file);
-            println!("Nota: se o autor original recusar/ignorar, seu repositório permanece como Fork válido.");
+            info!("Para: {}", target_address);
+            info!("Salvo em: {}", out_file);
+            info!("Nota: se o autor original recusar/ignorar, seu repositório permanece como Fork válido.");
         }
 
         Commands::ApprovePr { pr_file } => {
@@ -614,22 +848,22 @@ async fn main() -> anyhow::Result<()> {
             )?;
 
             let hash = save_commit(&merged_commit)?;
-            println!("PR aprovado! Novo commit oficial assinado: {}", hash);
+            info!("PR aprovado! Novo commit oficial assinado: {}", hash);
         }
 
         Commands::Status => {
             let id = read_identity()?;
-            println!("Endereço : {}", id.onion_like_address);
-            println!("Pubkey   : {}", id.public_key_hex);
+            info!("Endereço : {}", id.onion_like_address);
+            info!("Pubkey   : {}", id.public_key_hex);
             match read_head() {
-                Some(h) => println!("HEAD     : {}", h),
-                None => println!("HEAD     : (sem commits)"),
+                Some(h) => info!("HEAD     : {}", h),
+                None => info!("HEAD     : (sem commits)"),
             }
             let registry = AliasRegistry::load(Path::new(ALIASES_FILE))?;
             if !registry.records.is_empty() {
-                println!("Aliases  :");
+                info!("Aliases  :");
                 for key in registry.records.keys() {
-                    println!("  - {}", key);
+                    info!("  - {}", key);
                 }
             }
         }
@@ -638,20 +872,20 @@ async fn main() -> anyhow::Result<()> {
             let policy = resolve_policy(cli.strict, cli.yes);
             if target.ends_with(".p2pgit") {
                 let key = RepoIdentity::verify_address(&target)?;
-                println!("Endereço VÁLIDO: {}", target);
-                println!("Chave pública: {}", hex::encode(key.to_bytes()));
+                info!("Endereço VÁLIDO: {}", target);
+                info!("Chave pública: {}", hex::encode(key.to_bytes()));
             } else {
                 let commit: Commit = serde_json::from_str(&fs::read_to_string(&target)?)?;
                 client_download_guard(&commit, policy)?;
-                println!("Commit VÁLIDO: {}", commit.compute_hash());
-                println!("Autor: {}", commit.author_pubkey);
+                info!("Commit VÁLIDO: {}", commit.compute_hash());
+                info!("Autor: {}", commit.author_pubkey);
             }
         }
 
         Commands::CheckBinary { file, expected_md5 } => {
             let content = fs::read(&file)?;
             repo::verify_md5(&content, &expected_md5)?;
-            println!("MD5 OK: '{}' confere com o manifesto '.binary'.", file);
+            info!("MD5 OK: '{}' confere com o manifesto '.binary'.", file);
         }
 
         Commands::AddBinary {
@@ -677,21 +911,21 @@ async fn main() -> anyhow::Result<()> {
             let mut binaries: Vec<BinaryManifestEntry> =
                 serde_json::from_str(&fs::read_to_string(BINARIES_FILE)?).unwrap_or_default();
             let file_path = entry.file_path.clone();
-            if let Some(existing) = binaries.iter_mut().find(|b| b.file_path == file_path) {
-                *existing = entry.clone();
-                println!("Binário ATUALIZADO no '.binary': {}", file_path);
+            if let Some(existing) = binaries.iter_mut().find(|b| b.file_path == entry.file_path) {
+                *existing = entry;
+                info!("Binário ATUALIZADO no '.binary': {}", file_path);
             } else {
                 binaries.push(entry);
-                println!("Binário ADICIONADO ao '.binary': {}", file_path);
+                info!("Binário ADICIONADO ao '.binary': {}", file_path);
             }
             fs::write(BINARIES_FILE, serde_json::to_string_pretty(&binaries)?)?;
 
-            println!("MD5   : {}", md5);
-            println!("SHA256: {}", sha256);
+            info!("MD5   : {}", md5);
+            info!("SHA256: {}", sha256);
             if let Some(info) = &torrent_infohash {
-                println!("InfoHash: {}", info);
+                info!("InfoHash: {}", info);
             }
-            println!(
+            info!(
                 "\nO binário NÃO entra no commit de código puro — o commit referencia via '.binary'."
             );
         }
@@ -721,8 +955,7 @@ async fn main() -> anyhow::Result<()> {
                     let sha_ok = bin
                         .sha256_hash
                         .as_ref()
-                        .map(|s| repo::verify_sha256(&content, s).is_ok())
-                        .unwrap_or(true);
+                        .is_none_or(|s| repo::verify_sha256(&content, s).is_ok());
                     if md5_ok && sha_ok {
                         fs::write(&target, &content)?; // garante conteúdo verificado
                         serde_json::json!({
@@ -742,7 +975,7 @@ async fn main() -> anyhow::Result<()> {
                     serde_json::json!({
                         "file_path": bin.file_path,
                         "status": "failed",
-                        "reason": status.err().map(|e| e.to_string()).unwrap_or_else(|| "download error".into()),
+                        "reason": status.err().map_or_else(|| "download error".into(), |e| e.to_string()),
                     })
                 };
                 results.push(result);
@@ -753,30 +986,145 @@ async fn main() -> anyhow::Result<()> {
                 ".p2pgit/binaries.lock",
                 serde_json::to_string_pretty(&results)?,
             )?;
-            println!("Resultados de fetch-binaries salvos em .p2pgit/binaries.lock");
+            info!("Resultados de fetch-binaries salvos em .p2pgit/binaries.lock");
 
             for r in &results {
                 let status = r["status"].as_str().unwrap_or("unknown");
                 let path = r["file_path"].as_str().unwrap_or("?");
                 if status == "ok" {
-                    println!(
+                    info!(
                         "OK      : {} (download + validação MD5/SHA-256 concluídos)",
                         path
                     );
                 } else if status == "skipped" {
-                    println!(
+                    info!(
                         "IGNORADO: {} ({})",
                         path,
                         r["reason"].as_str().unwrap_or("sem infohash")
                     );
                 } else {
-                    println!(
+                    info!(
                         "FALHOU  : {} ({})",
                         path,
                         r["reason"].as_str().unwrap_or("erro")
                     );
                 }
             }
+        }
+
+        Commands::AddDep {
+            target,
+            pin,
+            mount,
+            name,
+            bootstrap,
+        } => {
+            read_identity()?; // precisa de repositório inicializado
+
+            // 1. O mount_path é relativo e não pode colidir com o metadata.
+            anyhow::ensure!(
+                !mount.starts_with('/')
+                    && !mount.starts_with("../")
+                    && mount != ".."
+                    && !mount.starts_with(".p2pgit"),
+                "mount_path inválido: '{mount}' (use caminho relativo, ex: deps/crypto)"
+            );
+
+            // 2. Endereço: válido localmente → alias local → DHT (feature network).
+            let target_address = if RepoIdentity::verify_address(&target).is_ok() {
+                target
+            } else {
+                let registry = AliasRegistry::load(Path::new(ALIASES_FILE))?;
+                if let Some(rec) = registry.resolve(&target, DEFAULT_CLIENT_NAMESPACE) {
+                    rec.target_address.clone()
+                } else {
+                    #[cfg(feature = "network")]
+                    {
+                        let boot = if bootstrap.is_empty() {
+                            p2p::default_bootstrap()
+                        } else {
+                            bootstrap.clone()
+                        };
+                        p2p::resolve_target_address(&target, &boot).await?
+                    }
+                    #[cfg(not(feature = "network"))]
+                    {
+                        let _ = &bootstrap;
+                        anyhow::bail!(
+                                "'{target}' não é endereço válido nem alias local — resolva alias pela DHT compilando com --features network (ou informe o endereço)."
+                            );
+                    }
+                }
+            };
+
+            // 3. Hash fixado: informado ou HEAD atual do alvo na DHT.
+            let pinned_hash = match pin {
+                Some(p) => {
+                    anyhow::ensure!(
+                        p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "use o hash completo (64 hex) em --pin (veja 'p2pgit log')."
+                    );
+                    p
+                }
+                None => {
+                    #[cfg(feature = "network")]
+                    {
+                        let policy = resolve_policy(cli.strict, cli.yes);
+                        let boot = if bootstrap.is_empty() {
+                            p2p::default_bootstrap()
+                        } else {
+                            bootstrap.clone()
+                        };
+                        let fetched = p2p::fetch_commit(&target_address, &boot, policy).await?;
+                        let head_hash = fetched.head.compute_hash();
+                        info!(
+                            "HEAD atual de {} resolvido: {}",
+                            target_address,
+                            &head_hash[..12]
+                        );
+                        head_hash
+                    }
+                    #[cfg(not(feature = "network"))]
+                    {
+                        let _ = &bootstrap;
+                        anyhow::bail!(
+                            "sem --pin é preciso resolver o HEAD do alvo na DHT — compile com --features network."
+                        );
+                    }
+                }
+            };
+
+            // 4. Grava (upsert por nome) em `.p2pdeps`.
+            let dep_name = name.unwrap_or_else(|| {
+                mount
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(mount.as_str())
+                    .to_string()
+            });
+            let entry = LinkedRepository {
+                name: dep_name.clone(),
+                target_address_or_alias: target_address.clone(),
+                pinned_commit_hash: pinned_hash.clone(),
+                mount_path: mount.clone(),
+            };
+            let mut deps: Vec<LinkedRepository> =
+                serde_json::from_str(&fs::read_to_string(DEPS_FILE)?).unwrap_or_default();
+            if let Some(existing) = deps.iter_mut().find(|d| d.name == dep_name) {
+                *existing = entry;
+                info!("Dependência '{}' ATUALIZADA em {}.", dep_name, DEPS_FILE);
+            } else {
+                deps.push(entry);
+                info!("Dependência '{}' adicionada a {}.", dep_name, DEPS_FILE);
+            }
+            fs::write(DEPS_FILE, serde_json::to_string_pretty(&deps)?)?;
+
+            info!(
+                "{} # {} -> {} (será montada no clone)",
+                target_address,
+                &pinned_hash[..12.min(pinned_hash.len())],
+                mount
+            );
         }
 
         #[cfg(feature = "network")]

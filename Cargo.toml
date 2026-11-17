@@ -11,12 +11,17 @@ rand = "0.8"
 sha2 = "0.10"
 md-5 = "0.10"          # Para validação do arquivo .binary (md5sum)
 data-encoding = "2.5"  # Base32 para endereço estilo .onion
+zeroize = { version = "1.8", features = ["derive"] }
 
 # Serialização e CLI
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
+
+# Observabilidade
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Rede P2P / DHT (Base para Torrent/Kademlia)
 # Habilitado via `cargo build --features network` (ver src/p2p.rs).
@@ -30,3 +35,10 @@ anyhow = "1.0"
 default = []
 # Transporte Kademlia real (main.rs não depende dele no MVP local).
 network = ["dep:libp2p"]
+
+[lints.rust]
+warnings = "warn"
+
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"
