@@ -17,8 +17,8 @@ MVP de um sistema de controle de versão P2P que combina:
 ```bash
 cargo build                     # MVP local (rápido)
 cargo build --features network  # inclui nó Kademlia/Gossipsub/Identify real
-cargo test                      # 27 testes unitários
-cargo test --features network   # 29 testes (inclui 2 nós em loopback)
+cargo test                      # 34 testes unitários
+cargo test --features network   # 36 testes (inclui 2 nós em loopback)
 ```
 
 O binário fica em `target/debug/git_torrent`.
@@ -34,8 +34,9 @@ O binário fica em `target/debug/git_torrent`.
 | `p2pgit show [hash]` | Mostra detalhes e arquivos de um commit (padrão: HEAD). |
 | `p2pgit checkout <hash>` | Restaura o diretório de trabalho em um commit antigo (HEAD detached), com todas as validações de segurança. |
 | `p2pgit clone <alvo> [--out clone] [--bootstrap <addr>...] [--depth N]` | Valida e clona um commit (arquivo `.json`, endereço `.p2pgit` ou alias). Com a feature `network`, busca o HEAD **e o histórico** na DHT antes de recorrer aos arquivos locais e monta as dependências do `.p2pdeps` (`--depth`, padrão 1). Aplica todos os bloqueios de segurança. |
-| `p2pgit create-pr <endereço> [--out pr.json]` | Gera um Pull Request **assinado pela chave do fork** (o alvo é validado como endereço ou alias). Se recusado, o fork permanece válido. |
-| `p2pgit approve-pr <pr.json>` | Verifica assinatura do PR, destinatário e autor do commit antes de re-assinar o merge com a chave privada do repositório original. |
+| `p2pgit create-pr <endereço> [--out pr.json] [--bootstrap <addr>...]` | Gera um Pull Request **assinado pela chave do fork** e, com a feature `network`, publica na DHT (`pr:<alvo>#<id>` + índice `<alvo>#prs`) e no gossipsub. Se recusado, o fork permanece válido. |
+| `p2pgit approve-pr <pr.json>` | Verifica assinatura do PR, destinatário, autor do commit, **conflitos de arquivos** e se o fork está desatualizado; faz merge 3-way trivial e aplica no diretório de trabalho. |
+| `p2pgit list-prs [--bootstrap <addr>...]` | Lista os PRs válidos deste repositório (índice na DHT + inbox do daemon), revalidando cada assinatura. |
 | `p2pgit status` | Mostra endereço, chave pública, HEAD e aliases. |
 | `p2pgit verify <endereço\|commit.json>` | Valida a checksum do endereço ou a assinatura do commit. |
 | `p2pgit check-binary <arquivo> <md5>` | Valida o MD5 de um binário baixado contra o manifesto `.binary`. |
@@ -117,6 +118,28 @@ No clone, binários ausentes viram aviso com a instrução `fetch-binaries`;
 binários presentes são **validados na hora** (divergência de hash bloqueia o
 clone). O resultado do download fica em `.p2pgit/binaries.lock`.
 
+## Colaboração: fork + Pull Request pela rede
+
+```bash
+# 1. Fork: clonar e gerar identidade própria no clone
+git_torrent clone <endereço> --out meu-fork --bootstrap <nó>
+cd meu-fork && git_torrent init --alias meu-fork
+
+# 2. Trabalhar e publicar o PR (registro na DHT + gossip)
+editar arquivos...
+git_torrent commit -m "minha contribuição"
+git_torrent create-pr <endereço-do-original> --bootstrap <nó>
+
+# 3. No repositório original (com o daemon rodando):
+git_torrent list-prs --bootstrap <nó>     # valida cada PR recebido
+git_torrent approve-pr pr_<id>.json      # merge 3-way + conflitos
+```
+
+O PR carrega o **ponto de divergência** (`base_commit_hash`), o que permite ao
+original detectar forks desatualizados e conflitos sem ter a cadeia do fork.
+Conflitos (mesmo arquivo alterado dos dois lados) são recusados para
+resolução manual; o merge nunca sobrescreve arquivos que só o autor mudou.
+
 ## `.p2pdeps` — repositórios essenciais linkados
 
 Evita inflar o repositório com dependências. Cada entrada aponta para outro endereço `.p2pgit`/alias em um commit **fixado**:
@@ -173,7 +196,8 @@ src/
 - O merge de PRs re-assina a árvore proposta como um novo commit filho do commit do fork, preservando o DAG.
 - **Binários via BitTorrent — Fase 2 concluída:** `add-binary` grava MD5 + SHA-256 + infohash no `.binary`; `fetch-binaries` baixa via magnet (`aria2c`) e valida a integridade; o guard do clone verifica `binaries/<file_path>` (ausente → aviso, divergente → bloqueio).
 - **Dependências `.p2pdeps` — Fase 3 concluída:** `add-dep` fixa um commit por hash (ou resolve o HEAD na DHT); o clone monta cada dependência em `<mount_path>` com recursão (`--depth`) e detecção de ciclo, registrando tudo em `.p2pgit/deps.lock`.
-- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 4 — PRs pela rede).
+- **PRs pela rede — Fase 4 concluída:** `create-pr` publica o PR na DHT (registro + índice `<alvo>#prs`, já que Kademlia não busca por prefixo) e no gossipsub; o `daemon` recebe PRs do seu tópico em `.p2pgit/inbox-prs.json`; `list-prs` lista e revalida; `approve-pr` recusa conflitos, avisa sobre forks desatualizados e faz merge 3-way sem reverter mudanças suas.
+- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 5 — endurecimento e produção).
 
 ### Testando a rede localmente (2 daemons)
 

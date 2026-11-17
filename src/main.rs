@@ -12,7 +12,7 @@ use network::{
     DEFAULT_NAMESPACE,
 };
 use repo::{BinaryManifestEntry, Commit, LinkedRepository, PullRequest};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -106,9 +106,18 @@ enum Commands {
         target_address: String,
         #[arg(short, long)]
         out: Option<String>,
+        /// Nodes bootstrap da DHT (feature 'network'); publica o PR na rede
+        #[arg(long)]
+        bootstrap: Vec<String>,
     },
     /// Verifica a assinatura de um PR e re-assina o merge com a chave original
     ApprovePr { pr_file: String },
+    /// Lista os PRs recebidos para este repositório (validando cada assinatura)
+    ListPrs {
+        /// Nodes bootstrap da DHT (feature 'network'); consulta o índice de PRs
+        #[arg(long)]
+        bootstrap: Vec<String>,
+    },
     /// Mostra o endereço, a chave pública e o estado atual do repositório
     Status,
     /// Valida um endereço .p2pgit ou um arquivo de commit
@@ -257,6 +266,100 @@ fn write_clone(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
 
 /// Escreve apenas os arquivos do commit (sem log) — usado no `mount_path`
 /// das dependências `.p2pdeps`.
+/// Ponto de divergência do fork: o primeiro commit da cadeia (andando do HEAD
+/// para trás) que NÃO foi assinado por esta identidade — ou seja, o commit do
+/// repositório original de onde o fork partiu. `None` se a cadeia inteira é do
+/// fork (repo nasceu aqui).
+fn fork_point(head_hash: &str, my_pubkey: &str) -> Option<String> {
+    let mut current = head_hash.to_string();
+    let mut visited = HashSet::new();
+    while !visited.contains(&current) {
+        visited.insert(current.clone());
+        let Ok(commit) = load_commit(&current) else {
+            return None; // histórico incompleto: não dá para afirmar
+        };
+        if !commit.author_pubkey.eq_ignore_ascii_case(my_pubkey) {
+            return Some(current); // primeiro commit que não é nosso = fork point
+        }
+        match commit.parent_hash {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Caminhos cujo conteúdo difere entre dois commits (ausência conta como
+/// alteração — arquivo adicionado ou removido).
+fn changed_paths(a: &Commit, b: &Commit) -> HashSet<String> {
+    let mut changed = HashSet::new();
+    for (path, content) in &a.files {
+        if b.files.get(path) != Some(content) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in b.files.keys() {
+        if !a.files.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed
+}
+
+/// Arquivos alterados dos DOIS lados desde `base` com conteúdo final
+/// diferente — o caso que exige resolução manual.
+fn detect_conflicts(local_head: &Commit, base: &Commit, proposed: &Commit) -> Vec<String> {
+    let ours = changed_paths(base, local_head);
+    let theirs = changed_paths(base, proposed);
+    let mut conflicts: Vec<String> = ours
+        .intersection(&theirs)
+        .filter(|p| local_head.files.get(*p) != proposed.files.get(*p))
+        .cloned()
+        .collect();
+    conflicts.sort();
+    conflicts
+}
+
+/// Merge 3-way trivial por arquivo: para cada caminho, se só um lado mudou
+/// desde a base, ganha esse lado; se ambos mudaram igual, tanto faz; se ambos
+/// mudaram diferente, é conflito (o chamador já recusou antes).
+///
+/// Evita o defeito clássico de sobrescrever a árvore do HEAD com a do fork —
+/// que reverteria mudanças do autor em arquivos que o fork nem tocou.
+fn merge_trees(base: &Commit, ours: &Commit, theirs: &Commit) -> BTreeMap<String, String> {
+    let mut merged = BTreeMap::new();
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(ours.files.keys().cloned());
+    paths.extend(base.files.keys().cloned());
+    paths.extend(theirs.files.keys().cloned());
+
+    for path in paths {
+        let base_v = base.files.get(&path);
+        let ours_v = ours.files.get(&path);
+        let theirs_v = theirs.files.get(&path);
+        let ours_changed = ours_v != base_v;
+        let theirs_changed = theirs_v != base_v;
+        let chosen = if theirs_changed && !ours_changed {
+            theirs_v // só o fork mexeu
+        } else {
+            ours_v // só nós mexemos, ninguém mexeu, ou os dois igual
+        };
+        if let Some(content) = chosen {
+            merged.insert(path, content.clone());
+        }
+    }
+    merged
+}
+
+/// Se o fork alterou o campo em relação à base, assume o dele; senão a base.
+fn pick_changed<T: PartialEq + Clone>(base: T, forked: &T) -> T {
+    if base == *forked {
+        base
+    } else {
+        forked.clone()
+    }
+}
+
 fn write_commit_files(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
     fs::create_dir_all(out_path)?;
     for (path, content) in &commit.files {
@@ -726,7 +829,9 @@ async fn main() -> anyhow::Result<()> {
                     Ok(fetched) => {
                         // Guard de segurança com base no diretório de saída.
                         client_download_guard_at(&fetched.head, policy, out_path)?;
-                        // Histórico completo primeiro (do mais antigo p/ o mais recente).
+                        // Histórico completo primeiro (do mais antigo p/ o mais recente), e o
+                        // HEAD também — sem ele `log`/`fork_point` não acham o
+                        // commit localmente.
                         let meta = out_path.join(".p2pgit");
                         fs::create_dir_all(&meta)?;
                         for commit in fetched.chain.iter().rev() {
@@ -738,6 +843,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         write_clone(out_path, &fetched.head)?;
                         let h = fetched.head.compute_hash();
+                        fs::write(
+                            meta.join(format!("commit_{}.json", h)),
+                            serde_json::to_string_pretty(&fetched.head)?,
+                        )?;
                         fs::write(meta.join("HEAD"), &h)?;
                         info!(
                             "Clonado da DHT: {} ({} commit(s) no histórico).",
@@ -773,29 +882,36 @@ async fn main() -> anyhow::Result<()> {
         Commands::CreatePr {
             target_address,
             out,
+            bootstrap,
         } => {
             let id = read_identity()?;
 
-            // O alvo precisa ser um endereço .p2pgit válido ou um alias registrado.
-            if target_address.ends_with(".p2pgit") {
-                RepoIdentity::verify_address(&target_address)?;
-            } else {
-                let registry = AliasRegistry::load(Path::new(ALIASES_FILE))?;
-                if registry
-                    .resolve(&target_address, DEFAULT_CLIENT_NAMESPACE)
-                    .is_none()
-                {
-                    anyhow::bail!(
-                        "Alvo '{}' não é um endereço .p2pgit válido nem um alias registrado.",
-                        target_address
-                    );
-                }
+            // O alvo precisa ser um endereço .p2pgit válido ou um alias
+            // registrado. (Alias também terminam em ".p2pgit" — por isso o
+            // registro local é consultado antes da validação de endereço.)
+            let registry = AliasRegistry::load(Path::new(ALIASES_FILE))?;
+            let is_address = RepoIdentity::verify_address(&target_address).is_ok();
+            let is_alias = registry
+                .resolve(&target_address, DEFAULT_CLIENT_NAMESPACE)
+                .is_some();
+            if !is_address && !is_alias {
+                anyhow::bail!(
+                    "Alvo '{}' não é um endereço .p2pgit válido nem um alias registrado.",
+                    target_address
+                );
             }
 
             let head = require_head()?;
             let proposed = load_commit(&head)?;
+            let base = fork_point(&head, &id.public_key_hex);
 
-            let pr = PullRequest::create(&id, target_address.clone(), proposed, head)?;
+            let pr = PullRequest::create(
+                &id,
+                target_address.clone(),
+                proposed,
+                head.clone(),
+                base.clone(),
+            )?;
 
             let out_file = out.unwrap_or_else(|| format!("pr_{}.json", pr.pr_id));
             fs::write(&out_file, serde_json::to_string_pretty(&pr)?)?;
@@ -807,6 +923,35 @@ async fn main() -> anyhow::Result<()> {
             info!("Para: {}", target_address);
             info!("Salvo em: {}", out_file);
             info!("Nota: se o autor original recusar/ignorar, seu repositório permanece como Fork válido.");
+
+            // Fase 4: publica o PR na rede (registro na DHT + gossipsub).
+            #[cfg(feature = "network")]
+            {
+                let boot = if bootstrap.is_empty() {
+                    p2p::default_bootstrap()
+                } else {
+                    bootstrap
+                };
+                match p2p::resolve_target_address(&target_address, &boot).await {
+                    Ok(address) => match p2p::publish_pr(&address, &pr, &boot).await {
+                        Ok(()) => info!(
+                            "PR publicado na rede: registro '{}' + tópico '{}'",
+                            p2p::pr_record_key(&address, &pr.pr_id),
+                            p2p::pr_topic(&address)
+                        ),
+                        Err(e) => warn!(
+                            "[pr] não foi possível publicar agora: {} (PR salvo localmente)",
+                            e
+                        ),
+                    },
+                    Err(e) => warn!(
+                        "[pr] alvo não resolvido na DHT ({}); PR salvo apenas localmente",
+                        e
+                    ),
+                }
+            }
+            #[cfg(not(feature = "network"))]
+            let _ = bootstrap;
         }
 
         Commands::ApprovePr { pr_file } => {
@@ -833,6 +978,63 @@ async fn main() -> anyhow::Result<()> {
             let policy = resolve_policy(cli.strict, cli.yes);
             client_download_guard(&pr.proposed_commit, policy)?;
 
+            // 4/5. Base do fork = commit original de onde o fork divergiu (registrado no
+            //      PR pelo fork). Se a base NÃO é o HEAD atual, o fork não tem
+            //      os commits que fizemos desde então → desatualizado.
+            let head_hash = read_head();
+            let up_to_date = head_hash
+                .as_ref()
+                .is_some_and(|h| Some(h) == pr.base_commit_hash.as_ref());
+            if !up_to_date {
+                warn!(
+                    "Fork desatualizado: base {} vs HEAD atual {} (o original avançou desde então).",
+                    pr.base_commit_hash
+                        .as_deref()
+                        .map_or("desconhecida", |h| &h[..12.min(h.len())]),
+                    head_hash
+                        .as_deref()
+                        .map_or("desconhecido", |h| &h[..12.min(h.len())])
+                );
+            }
+
+            // 5. Conflitos: arquivos alterados dos DOIS lados desde a base.
+            //    Precisa do conteúdo da base localmente; sem ela, segue com aviso.
+            let base = pr
+                .base_commit_hash
+                .as_ref()
+                .and_then(|p| load_commit(p).ok());
+            let mut merged_files = pr.proposed_commit.files.clone();
+            if let (Some(base), Some(head)) = (&base, &head_hash) {
+                if let Ok(current) = load_commit(head) {
+                    let conflicts = detect_conflicts(&current, base, &pr.proposed_commit);
+                    if !conflicts.is_empty() {
+                        anyhow::bail!(
+                            "Conflito de arquivos (alterados no HEAD e no PR): {}. Resolva manualmente antes de aprovar.",
+                            conflicts.join(", ")
+                        );
+                    }
+                    merged_files = merge_trees(base, &current, &pr.proposed_commit);
+                }
+            } else {
+                warn!(
+                    "Conteúdo da base do fork indisponível localmente — conflitos não verificados."
+                );
+            }
+
+            // Binários/deps: se o fork mexeu em relação à base, assume o dele.
+            let base_bin = pick_changed(
+                base.as_ref()
+                    .map(|b| b.external_binaries.clone())
+                    .unwrap_or_default(),
+                &pr.proposed_commit.external_binaries,
+            );
+            let base_deps = pick_changed(
+                base.as_ref()
+                    .map(|b| b.linked_repos.clone())
+                    .unwrap_or_default(),
+                &pr.proposed_commit.linked_repos,
+            );
+
             // Re-assina o código aprovado com a chave privada do repositório original.
             let merged_commit = Commit::create_signed(
                 &id,
@@ -841,14 +1043,93 @@ async fn main() -> anyhow::Result<()> {
                     "Merge PR de {}: {}",
                     pr.fork_author_pubkey, pr.proposed_commit.message
                 ),
-                pr.proposed_commit.files,
-                pr.proposed_commit.external_binaries,
-                pr.proposed_commit.linked_repos,
+                merged_files,
+                base_bin,
+                base_deps,
                 false,
             )?;
 
             let hash = save_commit(&merged_commit)?;
+            // Aplica o merge no diretório de trabalho (como um `git merge`).
+            for (path, content) in &merged_commit.files {
+                let dest = Path::new(path);
+                if let Some(parent) = dest.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                fs::write(dest, content)?;
+            }
             info!("PR aprovado! Novo commit oficial assinado: {}", hash);
+            info!(
+                "Merge aplicado ao diretório de trabalho ({} arquivo(s)).",
+                merged_commit.files.len()
+            );
+        }
+
+        Commands::ListPrs { bootstrap } => {
+            let id = read_identity()?;
+
+            // 1. Inbox local (PRs recebidos pelo daemon via gossipsub).
+            let inbox: Vec<PullRequest> = fs::read_to_string(Path::new(".p2pgit/inbox-prs.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            // 2. Índice de PRs na DHT (caminho determinístico).
+            #[cfg(feature = "network")]
+            let from_dht: Vec<PullRequest> = {
+                let boot = if bootstrap.is_empty() {
+                    p2p::default_bootstrap()
+                } else {
+                    bootstrap
+                };
+                match p2p::list_prs(&id.onion_like_address, &boot).await {
+                    Ok(prs) => prs,
+                    Err(e) => {
+                        warn!("[pr] índice de PRs não consultado: {}", e);
+                        Vec::new()
+                    }
+                }
+            };
+            #[cfg(not(feature = "network"))]
+            let from_dht: Vec<PullRequest> = {
+                let _ = bootstrap;
+                Vec::new()
+            };
+
+            // 3. Mescla e revalida TUDO (nada da rede entra sem validação).
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut valid: Vec<&PullRequest> = Vec::new();
+            for p in from_dht.iter().chain(inbox.iter()) {
+                if seen.insert(p.pr_id.as_str())
+                    && p.target_repo_address == id.onion_like_address
+                    && p.is_valid()
+                {
+                    valid.push(p);
+                }
+            }
+
+            if valid.is_empty() {
+                info!(
+                    "Nenhum PR válido para {} (o daemon precisa estar ouvindo 'p2pgit/pr/{}/v1').",
+                    id.onion_like_address, id.onion_like_address
+                );
+                return Ok(());
+            }
+            info!("{} PR(s) para {}:", valid.len(), id.onion_like_address);
+            for p in &valid {
+                info!(
+                    "  {} | fork {} | HEAD do fork {} | \"{}\"",
+                    p.pr_id,
+                    &p.fork_author_pubkey[..12.min(p.fork_author_pubkey.len())],
+                    &p.fork_head_hash[..12.min(p.fork_head_hash.len())],
+                    p.proposed_commit.message
+                );
+                for path in p.proposed_commit.files.keys() {
+                    info!("      arquivo: {}", path);
+                }
+            }
         }
 
         Commands::Status => {
@@ -1140,4 +1421,95 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Commit de teste com os arquivos informados.
+    fn commit_with(id: &RepoIdentity, files: &[(&str, &str)]) -> Commit {
+        let mut map = BTreeMap::new();
+        for (path, content) in files {
+            map.insert((*path).to_string(), (*content).to_string());
+        }
+        Commit::create_signed(id, None, "m".into(), map, vec![], vec![], false).unwrap()
+    }
+
+    #[test]
+    fn merge_trees_takes_independent_changes_from_both_sides() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let ours = commit_with(&id, &[("a", "2"), ("b", "1")]); // mudamos "a"
+        let theirs = commit_with(&id, &[("a", "1"), ("b", "2")]); // fork mudou "b"
+
+        let merged = merge_trees(&base, &ours, &theirs);
+        assert_eq!(merged.get("a").map(String::as_str), Some("2")); // nosso
+        assert_eq!(merged.get("b").map(String::as_str), Some("2")); // do fork
+    }
+
+    #[test]
+    fn merge_trees_does_not_revert_untouched_files() {
+        // O fork nasceu de uma base antiga: a árvore dele está "velha" em
+        // arquivos que nós mudamos e ele não tocou. O merge não pode voltar
+        // esses arquivos para trás.
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let ours = commit_with(&id, &[("a", "9"), ("b", "9")]);
+        let theirs = commit_with(&id, &[("a", "1"), ("b", "1"), ("c", "3")]); // só acrescenta c
+
+        let merged = merge_trees(&base, &ours, &theirs);
+        assert_eq!(merged.get("a").map(String::as_str), Some("9"));
+        assert_eq!(merged.get("b").map(String::as_str), Some("9"));
+        assert_eq!(merged.get("c").map(String::as_str), Some("3")); // veio do fork
+    }
+
+    #[test]
+    fn merge_trees_respects_fork_deletion() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let ours = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let theirs = commit_with(&id, &[("a", "1")]); // removeu b
+
+        let merged = merge_trees(&base, &ours, &theirs);
+        assert!(!merged.contains_key("b"));
+        assert_eq!(merged.get("a").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn detect_conflicts_ignores_disjoint_changes() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let head = commit_with(&id, &[("a", "1"), ("b", "2")]); // fork mudou só b
+        let proposed = commit_with(&id, &[("a", "2"), ("b", "1")]); // PR mudou só a
+        assert!(detect_conflicts(&head, &base, &proposed).is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_flags_same_file_both_sides() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let head = commit_with(&id, &[("a", "2"), ("b", "1")]);
+        let proposed = commit_with(&id, &[("a", "3"), ("b", "1")]);
+        assert_eq!(detect_conflicts(&head, &base, &proposed), vec!["a"]);
+    }
+
+    #[test]
+    fn detect_conflicts_accepts_identical_change_on_both_sides() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1")]);
+        let head = commit_with(&id, &[("a", "2")]);
+        let proposed = commit_with(&id, &[("a", "2")]); // mesma mudança
+        assert!(detect_conflicts(&head, &base, &proposed).is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_treats_missing_file_as_change() {
+        let id = RepoIdentity::generate(None);
+        let base = commit_with(&id, &[("a", "1"), ("b", "1")]);
+        let head = commit_with(&id, &[("a", "1")]); // removeu b
+        let proposed = commit_with(&id, &[("a", "1"), ("b", "9")]); // mudou b
+        assert_eq!(detect_conflicts(&head, &base, &proposed), vec!["b"]);
+    }
 }

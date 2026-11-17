@@ -29,7 +29,7 @@ use crate::network::{
     alias_record_key, commit_record_key, validate_commit_record, AliasEnvelope, AliasRegistry,
     GuardPolicy, HeadAnnouncement, DEFAULT_NAMESPACE,
 };
-use crate::repo::Commit;
+use crate::repo::{Commit, PullRequest};
 
 pub const ANNOUNCE_TOPIC: &str = "p2pgit/announce/v1";
 
@@ -665,6 +665,132 @@ pub async fn resolve_target_address(target: &str, bootstrap: &[String]) -> anyho
     resolve_address(&mut node, target).await
 }
 
+/// Tópico gossipsub dos PRs destinados a um endereço.
+pub fn pr_topic(target: &str) -> String {
+    format!("p2pgit/pr/{}/v1", target)
+}
+
+/// Chave do registro de um PR na DHT.
+pub fn pr_record_key(target: &str, pr_id: &str) -> String {
+    format!("pr:{}#{}", target, pr_id)
+}
+
+/// Chave do índice de PRs de um repositório (lista de `pr_id`s).
+/// Kademlia não faz busca por prefixo — sem um índice, ninguém conseguiria
+/// descobrir quais PRs existem para um endereço.
+pub fn pr_index_key(target: &str) -> String {
+    format!("{}#prs", target)
+}
+
+/// Adiciona `pr_id` ao índice de PRs do alvo (união, com verificação e
+/// retry para tolerar escritas concorrentes de forks diferentes).
+async fn append_pr_index(node: &mut P2pNode, target: &str, pr_id: &str) -> anyhow::Result<()> {
+    let key = pr_index_key(target);
+    for _ in 0..6 {
+        let current: Vec<String> = match node.get_record(&key).await? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if current.iter().any(|p| p == pr_id) {
+            return Ok(());
+        }
+        let mut updated = current;
+        updated.push(pr_id.to_string());
+        updated.sort();
+        node.put_record(&key, serde_json::to_vec(&updated)?).await?;
+
+        // Confirma a leitura: outra escrita concorrente pode ter sobrescrito.
+        let after: Vec<String> = node
+            .get_record(&key)
+            .await?
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        if after.iter().any(|p| p == pr_id) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("índice de PRs de '{target}' não pôde ser atualizado")
+}
+
+/// Publica um PR assinado na rede: registro `pr:<alvo>#<pr_id>` na DHT
+/// **e** anúncio no tópico gossipsub do alvo.
+///
+/// O PR é revalidado aqui (assinatura, destinatário) — nada entra na rede
+/// sem passar por essa validação.
+pub async fn publish_pr(
+    target: &str,
+    pr: &PullRequest,
+    bootstrap: &[String],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(pr.is_valid(), "PR com assinatura inválida — não publicado");
+    anyhow::ensure!(
+        pr.target_repo_address == target,
+        "PR destina-se a '{}', não a '{}'",
+        pr.target_repo_address,
+        target
+    );
+    let payload = serde_json::to_vec(pr)?;
+    let key = pr_record_key(target, &pr.pr_id);
+
+    let mut node = P2pNode::new(parse_bootstrap(bootstrap)?).await?;
+    node.put_record(&key, payload.clone()).await?;
+    // Índice determinístico: sem ele ninguém descobre os PRs do repositório.
+    append_pr_index(&mut node, target, &pr.pr_id).await?;
+    // Gossipsub (fast path, best effort): dá tempo da malha se formar.
+    node.gossip_subscribe(&pr_topic(target)).await?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    if let Err(e) = node.gossip_publish(&pr_topic(target), payload).await {
+        eprintln!("[pr] anúncio gossip não propagou ({e}); o registro na DHT basta");
+    }
+    Ok(())
+}
+
+/// Lista os PRs **válidos** de um endereço: lê o índice `<alvo>#prs` e busca
+/// cada registro `pr:<alvo>#<pr_id>`, revalidando assinatura e destinatário
+/// (o que está na rede nunca é confiado sem validação).
+pub async fn list_prs(target: &str, bootstrap: &[String]) -> anyhow::Result<Vec<PullRequest>> {
+    let mut node = P2pNode::new(parse_bootstrap(bootstrap)?).await?;
+    let index: Vec<String> = match node.get_record(&pr_index_key(target)).await? {
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        None => return Ok(Vec::new()),
+    };
+    let mut prs = Vec::new();
+    for pr_id in index {
+        let key = pr_record_key(target, &pr_id);
+        if let Some(bytes) = node.get_record(&key).await? {
+            if let Ok(pr) = serde_json::from_slice::<PullRequest>(&bytes) {
+                if pr.is_valid() && pr.target_repo_address == target {
+                    prs.push(pr);
+                }
+            }
+        }
+    }
+    Ok(prs)
+}
+
+/// Grava um PR recebido pelo gossipsub no inbox local (dedup por `pr_id` +
+/// `fork_head_hash`), sem confiar em nada: o chamador já validou a assinatura.
+pub fn store_pr_inbox(pr: &PullRequest) -> anyhow::Result<bool> {
+    let path = std::path::Path::new(".p2pgit/inbox-prs.json");
+    let mut inbox: Vec<PullRequest> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if inbox
+        .iter()
+        .any(|p| p.pr_id == pr.pr_id && p.fork_head_hash == pr.fork_head_hash)
+    {
+        return Ok(false);
+    }
+    inbox.push(pr.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&inbox)?)?;
+    Ok(true)
+}
+
 /// Sequência monotônica para registros mutáveis (BEP-44 style), persistida em `.p2pgit/seq`.
 pub fn next_seq() -> anyhow::Result<u64> {
     let path = std::path::Path::new(".p2pgit/seq");
@@ -765,6 +891,18 @@ pub async fn run_dht(bootstrap: Vec<String>) -> anyhow::Result<()> {
 
     node.gossip_subscribe(ANNOUNCE_TOPIC).await?;
 
+    // Recebe PRs destinados a ESTE repositório (tópico por endereço).
+    let own_address = std::fs::read_to_string(".p2pgit/identity.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<RepoIdentity>(&s).ok())
+        .map(|id| id.onion_like_address);
+    if let Some(address) = &own_address {
+        match node.gossip_subscribe(&pr_topic(address)).await {
+            Ok(()) => println!("Aguardando PRs no tópico '{}'", pr_topic(address)),
+            Err(e) => eprintln!("[pr] não foi possível subscrever: {}", e),
+        }
+    }
+
     match seed_local_repo(&mut node).await {
         Ok(n) if n > 0 => println!("{} registro(s) semeado(s) na DHT.", n),
         Ok(_) => println!("Nada para semear (repo não inicializado ou sem commits/aliases)."),
@@ -812,7 +950,32 @@ pub async fn run_dht(bootstrap: Vec<String>) -> anyhow::Result<()> {
                 message,
                 ..
             })) => {
-                let data = message.data;
+                let data = message.data.clone();
+                // 1. PR assinado destinado a este repositório?
+                if let Ok(pr) = serde_json::from_slice::<PullRequest>(&data) {
+                    let targeted = own_address
+                        .as_ref()
+                        .is_some_and(|a| *a == pr.target_repo_address);
+                    if !targeted {
+                        continue; // PR para outro repositório
+                    }
+                    if !pr.is_valid() {
+                        eprintln!("PR INVÁLIDO descartado (assinatura ou autor divergente).");
+                        continue;
+                    }
+                    match store_pr_inbox(&pr) {
+                        Ok(true) => println!(
+                            "PR {} recebido de {} ({} arquivo(s)) — salvo em .p2pgit/inbox-prs.json",
+                            pr.pr_id,
+                            &pr.fork_author_pubkey[..12.min(pr.fork_author_pubkey.len())],
+                            pr.proposed_commit.files.len()
+                        ),
+                        Ok(false) => println!("PR {} já estava no inbox — ignorado.", pr.pr_id),
+                        Err(e) => eprintln!("[pr] falha ao salvar inbox: {}", e),
+                    }
+                    continue;
+                }
+                // 2. Anúncio de HEAD.
                 match serde_json::from_slice::<HeadAnnouncement>(&data) {
                     Ok(ann) if ann.is_valid() => {
                         println!(
@@ -824,7 +987,7 @@ pub async fn run_dht(bootstrap: Vec<String>) -> anyhow::Result<()> {
                     Ok(_) => eprintln!(
                         "Anúncio INVÁLIDO descartado (assinatura/frescor/endereço inconsistentes)."
                     ),
-                    Err(_) => {} // mensagem que não é anúncio; ignorar
+                    Err(_) => {} // mensagem que não é anúncio/PR; ignorar
                 }
             }
             _ => {}

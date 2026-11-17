@@ -15,7 +15,7 @@ const IGNORE_FILE: &str = ".p2pgitignore";
 const SKIP_DIRS: [&str; 4] = [".p2pgit", ".git", "target", "node_modules"];
 
 /// Entrada do arquivo `.binary`.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct BinaryManifestEntry {
     pub file_path: String,
     pub md5_hash: String,
@@ -27,7 +27,7 @@ pub struct BinaryManifestEntry {
 }
 
 /// Repositórios essenciais linkados (Submódulos P2P).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LinkedRepository {
     pub name: String,
     pub target_address_or_alias: String, // Endereço .p2pgit ou alias
@@ -58,6 +58,10 @@ pub struct PullRequest {
     pub fork_author_pubkey: String,
     /// HEAD do fork no momento da proposta (detecta PRs desatualizados).
     pub fork_head_hash: String,
+    /// Commit do repositório original de onde o fork divergiu.
+    /// É o que permite ao original calcular conflitos sem ter a cadeia do fork.
+    #[serde(default)]
+    pub base_commit_hash: Option<String>,
     pub proposed_commit: Commit,
     /// Ed25519 do autor do fork sobre o payload canônico do PR.
     pub signature: String,
@@ -67,11 +71,12 @@ impl PullRequest {
     /// Payload canônico que é assinado pela chave privada do fork.
     fn payload(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             self.pr_id,
             self.target_repo_address,
             self.fork_author_pubkey,
             self.fork_head_hash,
+            self.base_commit_hash.as_deref().unwrap_or(""),
             self.proposed_commit.compute_hash()
         )
     }
@@ -82,6 +87,7 @@ impl PullRequest {
         target_address: String,
         proposed_commit: Commit,
         fork_head_hash: String,
+        base_commit_hash: Option<String>,
     ) -> anyhow::Result<Self> {
         let pr_id: String = fork_head_hash.chars().take(16).collect();
         let mut pr = Self {
@@ -89,6 +95,7 @@ impl PullRequest {
             target_repo_address: target_address,
             fork_author_pubkey: identity.public_key_hex.clone(),
             fork_head_hash,
+            base_commit_hash,
             proposed_commit,
             signature: String::new(),
         };
@@ -472,14 +479,25 @@ mod tests {
         .unwrap();
         let head = commit.compute_hash();
 
-        let pr = PullRequest::create(&fork, "g7x9k2m.p2pgit".into(), commit.clone(), head.clone())
-            .unwrap();
+        let pr = PullRequest::create(
+            &fork,
+            "g7x9k2m.p2pgit".into(),
+            commit.clone(),
+            head.clone(),
+            None,
+        )
+        .unwrap();
         assert!(pr.is_valid());
 
         // Assinatura forjada.
         let mut bad = pr.clone();
         bad.signature = "deadbeef".into();
         assert!(!bad.is_valid());
+
+        // A base do fork entra no payload assinado: alterá-la invalida o PR.
+        let mut tampered_base = pr.clone();
+        tampered_base.base_commit_hash = Some("aa".repeat(32));
+        assert!(!tampered_base.is_valid());
 
         // PR que apresenta commit de um TERCEIRO como se fosse do fork.
         let third = RepoIdentity::generate(None);
