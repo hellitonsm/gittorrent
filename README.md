@@ -17,8 +17,8 @@ MVP de um sistema de controle de versão P2P que combina:
 ```bash
 cargo build                     # MVP local (rápido)
 cargo build --features network  # inclui nó Kademlia/Gossipsub/Identify real
-cargo test                      # 20 testes unitários
-cargo test --features network   # 22 testes (inclui 2 nós em loopback)
+cargo test                      # 24 testes unitários
+cargo test --features network   # 26 testes (inclui 2 nós em loopback)
 ```
 
 O binário fica em `target/debug/git_torrent`.
@@ -39,6 +39,8 @@ O binário fica em `target/debug/git_torrent`.
 | `p2pgit status` | Mostra endereço, chave pública, HEAD e aliases. |
 | `p2pgit verify <endereço\|commit.json>` | Valida a checksum do endereço ou a assinatura do commit. |
 | `p2pgit check-binary <arquivo> <md5>` | Valida o MD5 de um binário baixado contra o manifesto `.binary`. |
+| `p2pgit add-binary <arquivo> [--description ...] [--torrent-infohash <40hex>]` | Registra o binário no manifesto `.binary` com MD5 **e SHA-256** calculados (o binário sai do commit de código puro). |
+| `p2pgit fetch-binaries [--out-dir binaries]` | Baixa via magnet (`aria2c`) os binários com `torrent_infohash` e valida MD5/SHA-256; grava o resultado em `.p2pgit/binaries.lock`. |
 | `p2pgit daemon [--bootstrap <peer/multiaddr>...]` | **(feature `network`)** Inicia o nó DHT, semeia o repositório local (HEAD + histórico + aliases) e anuncia novos HEADs via gossipsub. Bootstrap padrão: `~/.p2pgit/bootstrap.txt`. |
 
 Flags globais de segurança (aplicam-se a `clone`, `checkout`, `approve-pr` e `verify`):
@@ -87,24 +89,32 @@ Ao fazer `clone`, `checkout` ou `approve-pr`, o cliente executa `client_download
 
 ## `.binary` — binários fora do commit
 
-O código puro nunca contém binários. Eles são referenciados por MD5 e, opcionalmente, por `infohash` de torrent:
+O código puro nunca contém binários. Eles são referenciados por **MD5** (legado) e **SHA-256** (preferido), e opcionalmente por `infohash` de torrent:
 
 ```json
 [
   {
     "file_path": "assets/textura.png",
     "md5_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "sha256_hash": "d32b202dbebe7daadc26783c1e279fc535b2e83beceb22993703f9a67012b7d4",
     "torrent_infohash": "8a9b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
     "description": "Textura principal do jogo"
   }
 ]
 ```
 
-Após baixar o arquivo via BitTorrent comum, valide com:
+Registre e baixe com:
 
 ```bash
+git_torrent add-binary assets/textura.png --description "Textura principal" \
+  --torrent-infohash 8a9b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+git_torrent fetch-binaries          # usa magnet + aria2c; valida MD5/SHA-256
 git_torrent check-binary assets/textura.png d41d8cd98f00b204e9800998ecf8427e
 ```
+
+No clone, binários ausentes viram aviso com a instrução `fetch-binaries`;
+binários presentes são **validados na hora** (divergência de hash bloqueia o
+clone). O resultado do download fica em `.p2pgit/binaries.lock`.
 
 ## `.p2pdeps` — repositórios essenciais linkados
 
@@ -143,7 +153,8 @@ src/
 - O hash do commit é canônico (JSON serializado com vetores ordenados, sem assinatura) e cobre todos os campos, inclusive `mount_path` e `torrent_infohash`.
 - A busca de binários por `infohash` em trackers/DHT BitTorrent e a verificação automática pós-download ainda são responsabilidade do cliente/usuário (use `check-binary`).
 - O merge de PRs re-assina a árvore proposta como um novo commit filho do commit do fork, preservando o DAG.
-- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 2 — binários via BitTorrent).
+- **Binários via BitTorrent — Fase 2 concluída:** `add-binary` grava MD5 + SHA-256 + infohash no `.binary`; `fetch-binaries` baixa via magnet (`aria2c`) e valida a integridade; o guard do clone verifica `binaries/<file_path>` (ausente → aviso, divergente → bloqueio).
+- Próximos passos planejados: ver `docs/GUIA-IMPLEMENTACAO.md` (Fase 3 — dependências `.p2pdeps`).
 
 ### Testando a rede localmente (2 daemons)
 

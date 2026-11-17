@@ -15,10 +15,13 @@ const IGNORE_FILE: &str = ".p2pgitignore";
 const SKIP_DIRS: [&str; 4] = [".p2pgit", ".git", "target", "node_modules"];
 
 /// Entrada do arquivo `.binary`.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct BinaryManifestEntry {
     pub file_path: String,
     pub md5_hash: String,
+    /// Opcional; quando presente, é preferido na verificação.
+    #[serde(default)]
+    pub sha256_hash: Option<String>,
     pub torrent_infohash: Option<String>, // Hash para busca na rede BitTorrent comum
     pub description: String,
 }
@@ -208,16 +211,64 @@ pub fn verify_md5(content: &[u8], expected_hex: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// MD5 (hex, lowercase) do conteúdo — usado pelo `add-binary`.
+pub fn compute_md5_hex(content: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+/// SHA-256 (hex, lowercase) do conteúdo — alternativa forte ao MD5.
+pub fn compute_sha256_hex(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    hex::encode(digest)
+}
+
+/// Valida o SHA-256 de um arquivo baixado (preferido quando presente).
+pub fn verify_sha256(content: &[u8], expected_hex: &str) -> anyhow::Result<()> {
+    let actual = compute_sha256_hex(content);
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        anyhow::bail!(
+            "SHA-256 não confere! esperado='{}', obtido='{}'. Não execute o arquivo.",
+            expected_hex,
+            actual
+        );
+    }
+    Ok(())
+}
+
+/// Magnet URI BitTorrent a partir de um infohash (`urn:btih:<infohash>`).
+pub fn magnet_from_infohash(infohash: &str, file_name: &str) -> String {
+    format!("magnet:?xt=urn:btih:{}&dn={}", infohash, file_name)
+}
+
 /// Varre o diretório recursivamente e coleta todos os arquivos de texto puro.
 ///
-/// Ignora `SKIP_DIRS`, diretórios/arquivos ocultos (exceto `.p2pgitignore`)
-/// e os padrões declarados em `.p2pgitignore`. Arquivos não-UTF8 abortam o
-/// commit com instrução para movê-los ao manifesto `.binary`.
+/// Ignora `SKIP_DIRS`, diretórios/arquivos ocultos (exceto `.p2pgitignore`),
+/// os padrões declarados em `.p2pgitignore` e os binários já listados no
+/// manifesto `.binary` (que saem do commit de código puro). Arquivos
+/// não-UTF8 abortam o commit com instrução para movê-los ao `.binary`.
 pub fn collect_files(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     let patterns = load_ignore_patterns(root);
+    let manifest = load_manifest_paths(root);
     let mut files = BTreeMap::new();
-    walk_tree(root, root, &patterns, &mut files)?;
+    walk_tree(root, root, &patterns, &manifest, &mut files)?;
     Ok(files)
+}
+
+/// Caminhos (`file_path`) listados no manifesto `.binary`, para que a
+/// varredura não tente embutir binários no commit de código puro.
+fn load_manifest_paths(root: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(root.join(".binary")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<BinaryManifestEntry>>(&raw) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .map(|e| e.file_path.trim_start_matches("./").replace('\\', "/"))
+        .collect()
 }
 
 fn load_ignore_patterns(root: &Path) -> Vec<String> {
@@ -266,6 +317,7 @@ fn walk_tree(
     base: &Path,
     dir: &Path,
     patterns: &[String],
+    manifest_paths: &[String],
     out: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -283,10 +335,12 @@ fn walk_tree(
                 || name.starts_with('.')
                 || patterns.iter().any(|p| matches_ignore(p, &rel));
             if !skipped {
-                walk_tree(base, &path, patterns, out)?;
+                walk_tree(base, &path, patterns, manifest_paths, out)?;
             }
         } else if name == IGNORE_FILE
-            || (!name.starts_with('.') && !patterns.iter().any(|p| matches_ignore(p, &rel)))
+            || (!name.starts_with('.')
+                && !patterns.iter().any(|p| matches_ignore(p, &rel))
+                && !manifest_paths.iter().any(|p| p == &rel))
         {
             let bytes = std::fs::read(&path)?;
             let content = String::from_utf8(bytes).map_err(|_| {
@@ -361,6 +415,7 @@ mod tests {
         let binaries = vec![BinaryManifestEntry {
             file_path: "assets/t.png".into(),
             md5_hash: "d41d8cd98f00b204e9800998ecf8427e".into(),
+            sha256_hash: None,
             torrent_infohash: Some("8a9b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".into()),
             description: "textura".into(),
         }];
@@ -469,5 +524,79 @@ mod tests {
         assert!(!files.contains_key("build/out.rs"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_files_skips_binary_manifest_entries() {
+        let base = std::env::temp_dir().join(format!("p2pgit-test-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("assets")).unwrap();
+        std::fs::write(base.join("main.rs"), "fn main() {}").unwrap();
+        // Binário já registrado no '.binary' (ex.: textura PNG).
+        std::fs::write(base.join("assets/textura.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(
+            base.join(".binary"),
+            serde_json::to_string_pretty(&vec![BinaryManifestEntry {
+                file_path: "assets/textura.png".into(),
+                md5_hash: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                sha256_hash: None,
+                torrent_infohash: None,
+                description: "textura".into(),
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let files = collect_files(&base).unwrap();
+        assert!(files.contains_key("main.rs"));
+        assert!(!files.contains_key("assets/textura.png"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn binary_entry_serde_tolerates_legacy_json() {
+        // JSON legado (sem `sha256_hash`) deve deserializar com default null.
+        let legacy: BinaryManifestEntry = serde_json::from_str(
+            r#"{
+                "file_path": "assets/t.png",
+                "md5_hash": "d41d8cd98f00b204e9800998ecf8427e",
+                "torrent_infohash": "8a9b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+                "description": "textura"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sha256_hash, None);
+        assert_eq!(legacy.file_path, "assets/t.png");
+        assert_eq!(legacy.md5_hash, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn magnet_link_is_well_formed() {
+        let magnet = magnet_from_infohash(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "assets/textura.png",
+        );
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:aaaa"));
+        assert!(magnet.contains("dn=assets/textura.png"));
+
+        assert_eq!(
+            magnet_from_infohash("bbbb", "img.png"),
+            "magnet:?xt=urn:btih:bbbb&dn=img.png"
+        );
+    }
+
+    #[test]
+    fn md5_and_sha256_helpers_roundtrip() {
+        let content = b"hello p2pgit";
+        let md5 = compute_md5_hex(content);
+        assert_eq!(md5, "55db65c74c79ab20f1aaf6c6d9d9b8e1");
+        assert!(verify_md5(content, &md5).is_ok());
+        assert!(verify_md5(content, "00000000000000000000000000000000").is_err());
+
+        let sha = compute_sha256_hex(content);
+        assert_eq!(sha.len(), 64);
+        assert!(verify_sha256(content, &sha).is_ok());
+        assert!(verify_sha256(content, "00".repeat(32).as_str()).is_err());
     }
 }

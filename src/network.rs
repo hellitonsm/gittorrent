@@ -3,6 +3,7 @@ use crate::repo::Commit;
 use crate::sanitizer::{inspect_file_content, ContentStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -128,7 +129,20 @@ impl AliasRegistry {
 }
 
 /// Validação de segurança executada pelo cliente ao baixar/clonar um commit da rede torrent.
+///
+/// Binários listados no `.binary` são procurados em `<base>/binaries/<file_path>`
+/// (`base` = diretório raiz do repositório; `.` no repo corrente).
 pub fn client_download_guard(commit: &Commit, policy: GuardPolicy) -> anyhow::Result<()> {
+    client_download_guard_at(commit, policy, Path::new("."))
+}
+
+/// Como [`client_download_guard`], mas com base explícita para localizar
+/// `binaries/` — usado no clone, onde a saída é `--out <dir>`.
+pub fn client_download_guard_at(
+    commit: &Commit,
+    policy: GuardPolicy,
+    base: &Path,
+) -> anyhow::Result<()> {
     // 1. Verifica assinatura criptográfica do commit.
     if !commit.is_signature_valid() {
         anyhow::bail!(
@@ -175,17 +189,25 @@ pub fn client_download_guard(commit: &Commit, policy: GuardPolicy) -> anyhow::Re
         }
     }
 
-    // 4. Informa sobre binários externos listados no `.binary`.
-    if !commit.external_binaries.is_empty() {
-        println!(
-            "\n[INFO] Este repositório requer {} arquivo(s) do manifesto '.binary':",
-            commit.external_binaries.len()
-        );
-        for bin in &commit.external_binaries {
+    // 4. Binários externos: verificados quando presentes; ausentes → aviso
+    //    com instrução para rodar `p2pgit fetch-binaries`.
+    for bin in &commit.external_binaries {
+        let bin_path = base.join("binaries").join(&bin.file_path);
+        if !bin_path.exists() {
             println!(
-                "  - {} (MD5: {}) -> Buscar na rede BitTorrent comum",
+                "\n[AVISO] Binário '{}' ainda não baixado (esperado MD5 {}).",
                 bin.file_path, bin.md5_hash
             );
+            println!(
+                "        Rode 'p2pgit fetch-binaries' para obtê-lo da rede BitTorrent e depois 'p2pgit check-binary <arquivo> {}'.",
+                bin.md5_hash
+            );
+            continue;
+        }
+        let content = fs::read(&bin_path)?;
+        crate::repo::verify_md5(&content, &bin.md5_hash)?;
+        if let Some(sha) = &bin.sha256_hash {
+            crate::repo::verify_sha256(&content, sha)?;
         }
     }
 

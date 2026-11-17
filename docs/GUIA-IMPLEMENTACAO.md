@@ -11,7 +11,7 @@
 |---|---|---|
 | **0 — Consolidação do MVP local** | ✅ Concluída | Hash canônico (BTreeMap + vetores ordenados), varredura recursiva com `.p2pgitignore`, PR assinado anti-reencaminhamento, `log`/`show`/`checkout`, `GuardPolicy` + `--yes`/`--strict`, commits indexados por hash completo. 20 testes + clippy limpo. |
 | **1 — Rede real (DHT)** | ✅ Concluída | `P2pNode` com event-loop em background, `identify` (sem ele o kad fica em modo Client e ignora requests inbound), validação na borda via `validate_commit_record`, histórico completo `endereço#hash`, alias BEP-44 com `seq`, gossipsub `p2pgit/announce/v1`, bootstrap padrão em `~/.p2pgit/bootstrap.txt`. 22 testes com `--features network`. E2E: 2 daemons em loopback, clone por endereço e por alias, histórico de 2 commits, clone via 3º nó que só conhece um bootstrap. |
-| **2 — Binários via BitTorrent** | ⬜ Pendente | |
+| **2 — Binários via BitTorrent** | ✅ Concluída | `add-binary` (MD5 + SHA-256 + infohash opcional, grava em `.binary`), `fetch-binaries` (magnet → `aria2c` → valida MD5/SHA-256 → grava `.p2pgit/binaries.lock`), varredura do commit ignora binários do manifesto, guard no clone verifica `binaries/<file_path>` (ausente → aviso com instrução; divergente → bloqueio). 26 testes. E2E: binário ausente/correto/corrompido validados no clone. |
 | **3 — Dependências `.p2pdeps`** | ⬜ Pendente | |
 | **4 — PRs pela rede** | ⬜ Pendente | |
 | **5 — Endurecimento** | ⬜ Pendente | |
@@ -196,6 +196,13 @@
 ---
 
 ## Fase 2 — Binários via BitTorrent
+
+> **✅ Concluída** (2026-11-17). Comandos `add-binary` e `fetch-binaries`
+> implementados em `main.rs`; `BinaryManifestEntry` ganhou `sha256_hash`
+> (opcional, com compatibilidade retroativa de JSON legado); a varredura do
+> commit ignora binários listados no `.binary`; o guard do clone valida
+> `binaries/<file_path>` quando presentes e avisa quando ausentes. Download via
+> magnet usa `aria2c` externo (mensagem de instalação quando ausente).
 
 **Objetivo:** consumir e produzir o manifesto `.binary` de ponta a ponta.
 

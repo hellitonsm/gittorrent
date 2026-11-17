@@ -7,7 +7,10 @@ mod sanitizer;
 
 use clap::{Parser, Subcommand};
 use identity::RepoIdentity;
-use network::{client_download_guard, AliasRecord, AliasRegistry, GuardPolicy, DEFAULT_NAMESPACE};
+use network::{
+    client_download_guard, client_download_guard_at, AliasRecord, AliasRegistry, GuardPolicy,
+    DEFAULT_NAMESPACE,
+};
 use repo::{BinaryManifestEntry, Commit, LinkedRepository, PullRequest};
 use std::collections::HashSet;
 use std::fs;
@@ -96,6 +99,21 @@ enum Commands {
     Verify { target: String },
     /// Valida o MD5 de um arquivo baixado do manifesto '.binary'
     CheckBinary { file: String, expected_md5: String },
+    /// Adiciona um arquivo binário ao manifesto '.binary' (MD5/SHA-256 + infohash opcional)
+    AddBinary {
+        file: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// BitTorrent infohash (40 hex) para busca/download via rede
+        #[arg(long)]
+        torrent_infohash: Option<String>,
+    },
+    /// Busca na rede BitTorrent os binários referenciados no '.binary' (via magnet) e valida
+    FetchBinaries {
+        /// Diretório de destino dos downloads (padrão: binaries)
+        #[arg(long, default_value = "binaries")]
+        out_dir: String,
+    },
     /// Inicia um nó DHT Kademlia (requer a feature 'network')
     #[cfg(feature = "network")]
     Daemon {
@@ -197,6 +215,30 @@ fn write_clone(out_path: &Path, commit: &Commit) -> anyhow::Result<()> {
         commit.files.len()
     );
     println!("Commit clonado: {}", commit.compute_hash());
+    Ok(())
+}
+
+/// Baixa um magnet BitTorrent via cliente externo (`aria2c`).
+/// Requer `aria2c` instalado no sistema (ou outro cliente compatível).
+async fn download_via_magnet(magnet: &str, out_path: &Path) -> anyhow::Result<()> {
+    let mut cmd = tokio::process::Command::new("aria2c");
+    cmd.arg(magnet).arg("-o").arg(out_path);
+    let status = match cmd.status().await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "cliente de torrent 'aria2c' não encontrado. Instale (ex.: 'sudo apt install aria2') \
+                 ou use outro cliente compatível com magnet links."
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !status.success() {
+        anyhow::bail!("aria2c falhou com exit code {:?}", status.code());
+    }
+    if !out_path.exists() {
+        anyhow::bail!("aria2c não produziu o arquivo em {}", out_path.display());
+    }
     Ok(())
 }
 
@@ -441,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
             // 1. Caminho local simples: arquivo de commit existente.
             if Path::new(&target).exists() {
                 let commit: Commit = serde_json::from_str(&fs::read_to_string(&target)?)?;
-                client_download_guard(&commit, policy)?;
+                client_download_guard_at(&commit, policy, out_path)?;
                 write_clone(out_path, &commit)?;
                 return Ok(());
             }
@@ -457,6 +499,8 @@ async fn main() -> anyhow::Result<()> {
                 };
                 match p2p::fetch_commit(&target, &boot, policy).await {
                     Ok(fetched) => {
+                        // Guard de segurança com base no diretório de saída.
+                        client_download_guard_at(&fetched.head, policy, out_path)?;
                         // Histórico completo primeiro (do mais antigo p/ o mais recente).
                         let meta = out_path.join(".p2pgit");
                         fs::create_dir_all(&meta)?;
@@ -608,6 +652,131 @@ async fn main() -> anyhow::Result<()> {
             let content = fs::read(&file)?;
             repo::verify_md5(&content, &expected_md5)?;
             println!("MD5 OK: '{}' confere com o manifesto '.binary'.", file);
+        }
+
+        Commands::AddBinary {
+            file,
+            description,
+            torrent_infohash,
+        } => {
+            let content = fs::read(&file)?;
+            let md5 = repo::compute_md5_hex(&content);
+            let sha256 = repo::compute_sha256_hex(&content);
+            let entry = BinaryManifestEntry {
+                file_path: Path::new(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_string(),
+                md5_hash: md5.clone(),
+                sha256_hash: Some(sha256.clone()),
+                torrent_infohash: torrent_infohash.clone(),
+                description: description.unwrap_or_else(|| "binário externo".to_string()),
+            };
+
+            let mut binaries: Vec<BinaryManifestEntry> =
+                serde_json::from_str(&fs::read_to_string(BINARIES_FILE)?).unwrap_or_default();
+            let file_path = entry.file_path.clone();
+            if let Some(existing) = binaries.iter_mut().find(|b| b.file_path == file_path) {
+                *existing = entry.clone();
+                println!("Binário ATUALIZADO no '.binary': {}", file_path);
+            } else {
+                binaries.push(entry);
+                println!("Binário ADICIONADO ao '.binary': {}", file_path);
+            }
+            fs::write(BINARIES_FILE, serde_json::to_string_pretty(&binaries)?)?;
+
+            println!("MD5   : {}", md5);
+            println!("SHA256: {}", sha256);
+            if let Some(info) = &torrent_infohash {
+                println!("InfoHash: {}", info);
+            }
+            println!(
+                "\nO binário NÃO entra no commit de código puro — o commit referencia via '.binary'."
+            );
+        }
+
+        Commands::FetchBinaries { out_dir } => {
+            let binaries: Vec<BinaryManifestEntry> =
+                serde_json::from_str(&fs::read_to_string(BINARIES_FILE)?).unwrap_or_default();
+            let mut results: Vec<serde_json::Value> = Vec::new();
+
+            for bin in &binaries {
+                let Some(infohash) = bin.torrent_infohash.clone() else {
+                    results.push(serde_json::json!({
+                        "file_path": bin.file_path,
+                        "status": "skipped",
+                        "reason": "sem torrent_infohash",
+                    }));
+                    continue;
+                };
+
+                let magnet = repo::magnet_from_infohash(&infohash, &bin.file_path);
+                let target = Path::new(&out_dir).join(&bin.file_path);
+                let status = download_via_magnet(&magnet, &target).await;
+
+                let result = if status.is_ok() {
+                    let content = fs::read(&target)?;
+                    let md5_ok = repo::verify_md5(&content, &bin.md5_hash).is_ok();
+                    let sha_ok = bin
+                        .sha256_hash
+                        .as_ref()
+                        .map(|s| repo::verify_sha256(&content, s).is_ok())
+                        .unwrap_or(true);
+                    if md5_ok && sha_ok {
+                        fs::write(&target, &content)?; // garante conteúdo verificado
+                        serde_json::json!({
+                            "file_path": bin.file_path,
+                            "status": "ok",
+                            "md5": bin.md5_hash,
+                            "sha256": bin.sha256_hash.clone().unwrap_or_default(),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "file_path": bin.file_path,
+                            "status": "failed",
+                            "reason": format!("integridade falhou (md5_ok={} sha_ok={})", md5_ok, sha_ok),
+                        })
+                    }
+                } else {
+                    serde_json::json!({
+                        "file_path": bin.file_path,
+                        "status": "failed",
+                        "reason": status.err().map(|e| e.to_string()).unwrap_or_else(|| "download error".into()),
+                    })
+                };
+                results.push(result);
+            }
+
+            fs::create_dir_all(".p2pgit")?;
+            fs::write(
+                ".p2pgit/binaries.lock",
+                serde_json::to_string_pretty(&results)?,
+            )?;
+            println!("Resultados de fetch-binaries salvos em .p2pgit/binaries.lock");
+
+            for r in &results {
+                let status = r["status"].as_str().unwrap_or("unknown");
+                let path = r["file_path"].as_str().unwrap_or("?");
+                if status == "ok" {
+                    println!(
+                        "OK      : {} (download + validação MD5/SHA-256 concluídos)",
+                        path
+                    );
+                } else if status == "skipped" {
+                    println!(
+                        "IGNORADO: {} ({})",
+                        path,
+                        r["reason"].as_str().unwrap_or("sem infohash")
+                    );
+                } else {
+                    println!(
+                        "FALHOU  : {} ({})",
+                        path,
+                        r["reason"].as_str().unwrap_or("erro")
+                    );
+                }
+            }
         }
 
         #[cfg(feature = "network")]
