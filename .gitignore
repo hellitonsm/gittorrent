@@ -1,0 +1,55 @@
+# Rust
+/target/
+*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+events*.log
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Binary files (from .binary manifests)
+*.binary
+*.torrent
+
+# Cache directories
+.cache/
+.npm/
+node_modules/
+
+# IDE/Editor settings
+*.swp
+*.swo
+*~
+
+# System files
+.System
+
+# Cargo registry cache
+.cargo/registry/cache/
+
+# Local p2pgit state
+.p2pgit/
+!.p2pgit/identity.json
+!.p2pgit/commit_*.json
+!.p2pgit/HEAD
+!.p2pgit/aliases.json
+!.p2pgit/seq
+
+# Test artifacts
+*.pdb
+*.dSYM

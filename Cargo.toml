@@ -1,0 +1,32 @@
+[package]
+name = "git_torrent"
+version = "0.1.0"
+edition = "2021"
+description = "Git descentralizado sobre Torrent/DHT em Rust (MVP)"
+
+[dependencies]
+# Criptografia (estilo Bitcoin/Tor)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+md-5 = "0.10"          # Para validação do arquivo .binary (md5sum)
+data-encoding = "2.5"  # Base32 para endereço estilo .onion
+
+# Serialização e CLI
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+
+# Rede P2P / DHT (Base para Torrent/Kademlia)
+# Habilitado via `cargo build --features network` (ver src/p2p.rs).
+# `identify` é essencial: sem ele os nós não confirmam endereço externo e o
+# kad fica em modo Client (não responde requests inbound).
+libp2p = { version = "0.53", optional = true, features = ["tokio", "kad", "gossipsub", "identify", "noise", "tcp", "yamux", "macros"] }
+tokio = { version = "1.37", features = ["full"] }
+anyhow = "1.0"
+
+[features]
+default = []
+# Transporte Kademlia real (main.rs não depende dele no MVP local).
+network = ["dep:libp2p"]
